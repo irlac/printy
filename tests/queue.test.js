@@ -186,6 +186,22 @@ function grayGradient(w, h) {
     ok(T.queueKindFor({name: 'photo.png', type: 'image/png'}) === 'image', 'kind: image');
     ok(T.queueKindFor({name: 'scan.PDF', type: ''}) === 'pdf', 'kind: pdf by extension case-insensitive');
   }
+  // 9. Multi-file adds sort by name, naturally: a numbered set lands
+  //    in set order no matter what order the picker returned it in.
+  {
+    const names = ['10.jpg', '2.jpg', '1.jpg', 'a2.png', 'a10.png', 'a1.png', 'B.jpg', 'a.jpg'];
+    const sorted = [...names].sort(T.naturalCompare);
+    ok(JSON.stringify(sorted) === JSON.stringify(['1.jpg', '2.jpg', '10.jpg', 'a1.png', 'a2.png', 'a10.png', 'a.jpg', 'B.jpg']),
+      'natural sort (got ' + JSON.stringify(sorted) + ')');
+    const shuffled = [{name: '03.jpg'}, {name: '01.jpg'}, {name: '10.jpg'}, {name: '02.jpg'}];
+    const ordered = T.sortFilesByName(shuffled).map(f => f.name);
+    ok(JSON.stringify(ordered) === JSON.stringify(['01.jpg', '02.jpg', '03.jpg', '10.jpg']),
+      'numbered set in order (got ' + JSON.stringify(ordered) + ')');
+    ok(JSON.stringify(shuffled.map(f => f.name)) === JSON.stringify(['03.jpg', '01.jpg', '10.jpg', '02.jpg']),
+      'sort does not mutate the input list');
+    const dups = T.sortFilesByName([{name: 'x.jpg', id: 1}, {name: 'x.jpg', id: 2}]).map(f => f.id);
+    ok(JSON.stringify(dups) === JSON.stringify([1, 2]), 'stable: identical names keep original order');
+  }
 
   console.log(fails === 0 ? '\nALL QUEUE TESTS PASSED' : '\n' + fails + ' FAILURES');
   process.exit(fails === 0 ? 0 : 1);

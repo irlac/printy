@@ -137,7 +137,7 @@ function loadApp() {
   const html = fs.readFileSync(__dirname + '/../index.html', 'utf8');
   const m = html.match(/<script>([\s\S]*)<\/script>/);
   if (!m) throw new Error('no script in index.html');
-  eval(m[1] + '\n;globalThis.__T={streamRaster,printJob,buildJob,jobHeadBytes,rasterSegmentHeader,JOB_FOOT,PKG_END,engineState,makeJobCtl,CancelledError,renderSourceRows,makeBandDither,packBitsFromBin,queueGeom,parsePages,scanSourceBbox,queueRowStream,newCanvas,canvasToGray,applyLevels,dither,queueKindFor};');
+  eval(m[1] + '\n;globalThis.__T={streamRaster,printJob,buildJob,jobHeadBytes,rasterSegmentHeader,JOB_FOOT,PKG_END,engineState,makeJobCtl,CancelledError,renderSourceRows,makeBandDither,packBitsFromBin,queueGeom,parsePages,scanSourceBbox,queueRowStream,newCanvas,canvasToGray,applyLevels,dither,queueKindFor,naturalCompare,sortFilesByName};');
   return globalThis.__T;
 }
 

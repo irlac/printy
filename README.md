@@ -15,7 +15,7 @@ Tabs: **Studio** (compose text/image/QR/barcode/icon designs),
 Stack files into one continuous strip and print them as a single job:
 
 - Formats: PNG, JPEG, WebP, GIF (first frame), BMP, multi-page PDF.
-- Add files via picker or drag-and-drop; reorder with ↑/↓, remove with ✕.
+- Add files via picker or drag-and-drop; files added together are sorted by name (naturally: 01, 02, … 10), so a numbered set lands in set order. Reorder with ↑/↓, remove with ✕.
 - Per item: scale %, dither mode, gap rows after the item, trim-white
   toggle; PDFs also get a page selector (`all`, `1,3`, `2-4`).
 - **Prepare** measures every item, renders a dithered half-scale

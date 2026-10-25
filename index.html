@@ -2147,8 +2147,38 @@ function queueRenderList(){
   });
   if(!queuePrepared)$('queueSummary').textContent=queueItems.length+' item(s) — press Prepare to measure and preview';
 }
+/* Natural filename order: numeric runs compare as numbers, so
+   01, 02, … 10 sort in that order instead of 01, 10, 02. Non-numeric
+   runs compare case-insensitively (ties broken case-sensitively so
+   the order is fully deterministic). Hand-rolled, not localeCompare,
+   so the order is identical in every browser and in Node tests. */
+function naturalCompare(a,b){
+  const aa=String(a).match(/\d+|\D+/g)||[];
+  const bb=String(b).match(/\d+|\D+/g)||[];
+  for(let i=0;i<Math.max(aa.length,bb.length);i++){
+    if(aa[i]===undefined)return -1;
+    if(bb[i]===undefined)return 1;
+    if(aa[i]===bb[i])continue;
+    const na=/^\d+$/.test(aa[i]),nb=/^\d+$/.test(bb[i]);
+    if(na&&nb){
+      const d=(+aa[i])-(+bb[i]);
+      if(d)return d;
+      return aa[i].length-bb[i].length; // same value: fewer leading zeros first
+    }
+    const la=aa[i].toLowerCase(),lb=bb[i].toLowerCase();
+    if(la!==lb)return la<lb?-1:1;
+    return aa[i]<bb[i]?-1:1;
+  }
+  return 0;
+}
+/* Files picked together come back from the OS in selection order (or
+   worse), which reads as random. Sort by name so a numbered set lands
+   in set order. Stable: identical names keep their original order. */
+function sortFilesByName(list){
+  return [...list].sort((x,y)=>naturalCompare(x.name,y.name));
+}
 function queueAddFiles(list){
-  for(const f of list)queueItems.push(queueDefaultItem(f));
+  for(const f of sortFilesByName(list))queueItems.push(queueDefaultItem(f));
   queueInvalidate();queueRenderList();
   toast(queueItems.length+' item(s) in queue');
 }
