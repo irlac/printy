@@ -19,8 +19,11 @@ Stack files into one continuous strip and print them as a single job:
 - Per item: scale %, dither mode, gap rows after the item, trim-white
   toggle; PDFs also get a page selector (`all`, `1,3`, `2-4`).
 - **Prepare** measures every item, renders a dithered half-scale
-  preview strip, and reports total rows + estimated time. The job then
-  sits in state **Ready** until you press **Start printing**.
+  preview strip, and reports total rows + estimated time. Each image
+  (or PDF page) prints whole as one package, with an automatic line
+  break between packages — the printer's own feed lands in the break,
+  never inside an image. The job then sits in state **Ready** until
+  you press **Start printing**.
 - **Pause** stops between raster segments (never mid-segment);
   **Resume** continues exactly where it stopped; **Cancel** stops
   cleanly with no footer. After a failed or cancelled attempt, Start

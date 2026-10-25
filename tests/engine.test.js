@@ -132,13 +132,14 @@ global.confirm = () => true;
 const html = fs.readFileSync(__dirname + '/../index.html', 'utf8');
 const m = html.match(/<script>([\s\S]*)<\/script>/);
 if (!m) { console.log('FATAL: no script'); process.exit(1); }
-eval(m[1] + '\n;globalThis.__T={streamRaster,printJob,buildJob,jobHeadBytes,rasterSegmentHeader,JOB_FOOT,engineState,makeJobCtl,CancelledError};');
+eval(m[1] + '\n;globalThis.__T={streamRaster,printJob,buildJob,jobHeadBytes,rasterSegmentHeader,JOB_FOOT,PKG_END,engineState,makeJobCtl,CancelledError};');
 const T = globalThis.__T;
 
 let fails = 0;
 const ok = (c, msg) => { if (!c) { fails++; console.log('FAIL:', msg); } else console.log('ok:', msg); };
 const eq = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
-const FAST = {gapMs: 0, chunkBytes: 1024, segmentRows: 128};
+const FAST = {gapMs: 0, chunkBytes: 1024};
+const BIGCAP = {maxSegmentRows: 100000};
 function makeBmp(rows, fill) {
   const bmp = new Uint8Array(48 * rows);
   if (fill === 'black') bmp.fill(0xff);
@@ -160,17 +161,18 @@ async function* blocksOf(bmp, blockRows) {
     ok(r.sentRows === 64 && r.segments === 1, 'small job = 1 segment');
     ok(sim.headReceived && sim.footReceived && !sim.discarded && !sim.parseError, 'small job parses clean');
   }
-  // 2. Segmentation: 300 rows -> 128 + 128 + 44, one head, one foot, nothing between.
+  // 2. Split mode (opt-in): 300 rows with maxRows 128 -> 128 + 128 + 44,
+  //    one head, one foot, nothing between.
   {
     const bmp = makeBmp(300, 'random');
     const sim = new SimTransport();
-    await T.printJob(bmp, 300, {transport: sim, ...FAST});
-    ok(sim.segments.map(s => s.rows).join(',') === '128,128,44', '300 rows segmented 128/128/44 (got ' + sim.segments.map(s => s.rows).join(',') + ')');
-    ok(sim.footReceived && sim.segments.length === 3, 'one foot after 3 segments');
-    ok(eq(sim.raster, bmp), 'segmented raster reconstructs exactly');
+    await T.printJob(bmp, 300, {transport: sim, ...FAST, maxRows: 128});
+    ok(sim.segments.map(s => s.rows).join(',') === '128,128,44', 'split 300 rows -> 128/128/44 (got ' + sim.segments.map(s => s.rows).join(',') + ')');
+    ok(sim.footReceived && sim.segments.length === 3, 'one foot after 3 split blocks');
+    ok(eq(sim.raster, bmp), 'split raster reconstructs exactly');
   }
-  // 3. THE DIAGNOSIS: legacy single-block tall job is discarded (blank);
-  //    the segmented engine prints the same bitmap in full.
+  // 3. THE 2.0 DIAGNOSIS: legacy single-block tall job is discarded (blank);
+  //    the split engine prints the same bitmap in full under the same cap.
   {
     const bmp = makeBmp(1000, 'random');
     const legacy = T.buildJob(bmp, 1000); // one GS v 0 with height=1000
@@ -178,15 +180,16 @@ async function* blocksOf(bmp, blockRows) {
     for (let o = 0; o < legacy.length; o += 1024) await simOld.write(legacy.slice(o, o + 1024));
     ok(simOld.discarded && simOld.rowsReceived === 0, 'legacy 1000-row single block discarded -> blank output');
     const simNew = new SimTransport({maxSegmentRows: 255});
-    await T.printJob(bmp, 1000, {transport: simNew, ...FAST});
-    ok(!simNew.discarded && simNew.rowsReceived === 1000, 'segmented engine prints all 1000 rows under the same cap');
-    ok(eq(simNew.raster, bmp), 'segmented 1000-row raster byte-exact, no missing/duplicated rows');
+    await T.printJob(bmp, 1000, {transport: simNew, ...FAST, maxRows: 128});
+    ok(!simNew.discarded && simNew.rowsReceived === 1000, 'split engine prints all 1000 rows under the same cap');
+    ok(eq(simNew.raster, bmp), 'split 1000-row raster byte-exact, no missing/duplicated rows');
   }
-  // 4. Multi-item queue stream: blocks + spacing concatenate in order.
+  // 4. Multi-item queue stream: blocks + spacing concatenate in order
+  //    (one package by default; high-cap sim so the block itself is not capped).
   {
     const a = makeBmp(100, 'stripe'), b = makeBmp(200, 'black'), gap = new Uint8Array(48 * 24);
     const total = 100 + 24 + 200;
-    const sim = new SimTransport();
+    const sim = new SimTransport(BIGCAP);
     async function* src() { yield a; yield gap; yield b; }
     const r = await T.streamRaster(src(), total, {transport: sim, ...FAST, label: 'queue test'});
     const expect = new Uint8Array(48 * total);
@@ -195,9 +198,9 @@ async function* blocksOf(bmp, blockRows) {
     ok(r.sentRows === total, 'queue sentRows == total');
   }
   // 5. Disconnect mid-print: engine throws, state failed, no foot, no resend.
+  //    (One 1000-row package now; the sim dies inside the package's data.)
   {
     const bmp = makeBmp(1000, 'random');
-    // head(11) + seg header(8) + 128 rows(6144) + seg header(8) + 1000 B -> dies inside segment 2
     const sim = new SimTransport({failAfterBytes: 11 + 8 + 6144 + 8 + 1000});
     let threw = null;
     try { await T.printJob(bmp, 1000, {transport: sim, ...FAST}); } catch (e) { threw = e; }
@@ -207,25 +210,27 @@ async function* blocksOf(bmp, blockRows) {
     ok(T.engineState.sentRows < 1000, 'sentRows < total after disconnect (' + T.engineState.sentRows + ')');
   }
   // 6. Cancel mid-print: clean stop, no foot, state cancelled.
+  //    (Split mode so a block boundary exists at 128 rows to stop at.)
   {
     const bmp = makeBmp(1000, 'random');
     const sim = new SimTransport();
     const ctl = T.makeJobCtl();
-    const r = await T.printJob(bmp, 1000, {transport: sim, ...FAST, ctl,
+    const r = await T.printJob(bmp, 1000, {transport: sim, ...FAST, maxRows: 128, ctl,
       onProgress: (sent) => { if (sent >= 128) ctl.cancelled = true; }});
     ok(r.cancelled === true, 'cancel returns cancelled:true');
     ok(T.engineState.state === 'cancelled', 'state cancelled');
     ok(!sim.footReceived, 'no footer after cancel');
-    ok(sim.rowsReceived === 128, 'cancel stops at a segment boundary (128 rows, got ' + sim.rowsReceived + ')');
+    ok(sim.rowsReceived === 128, 'cancel stops at a block boundary (128 rows, got ' + sim.rowsReceived + ')');
   }
   // 7. Pause/resume: full raster, no duplicates, state really passes through paused.
+  //    (Split mode so a block boundary exists at 128 rows to pause at.)
   {
     const bmp = makeBmp(300, 'stripe');
     const sim = new SimTransport();
     const ctl = T.makeJobCtl();
     let sawPaused = false;
     const poll = setInterval(() => { if (T.engineState.state === 'paused') sawPaused = true; }, 20);
-    const r = await T.printJob(bmp, 300, {transport: sim, ...FAST, ctl,
+    const r = await T.printJob(bmp, 300, {transport: sim, ...FAST, maxRows: 128, ctl,
       onProgress: (sent) => {
         if (sent === 128 && !ctl.paused) {
           ctl.paused = true;
@@ -240,19 +245,19 @@ async function* blocksOf(bmp, blockRows) {
   // 8. Dense black: 512 rows of solid black reconstruct exactly.
   {
     const bmp = makeBmp(512, 'black');
-    const sim = new SimTransport();
+    const sim = new SimTransport(BIGCAP);
     await T.printJob(bmp, 512, {transport: sim, ...FAST});
     ok(eq(sim.raster, bmp) && sim.rowsReceived === 512, 'dense black 512 rows byte-exact');
   }
   // 9. Row alignment: random bitmap, every row lands at its own offset.
   {
     const bmp = makeBmp(257, 'random');
-    const sim = new SimTransport();
+    const sim = new SimTransport(BIGCAP);
     await T.printJob(bmp, 257, {transport: sim, ...FAST});
     let aligned = true;
     for (let y = 0; y < 257; y++) for (let x = 0; x < 48; x++)
       if (sim.raster[y * 48 + x] !== bmp[y * 48 + x]) { aligned = false; break; }
-    ok(aligned, '257 random rows all aligned (no off-by-one at segment seams)');
+    ok(aligned, '257 random rows all aligned (no off-by-one at block seams)');
   }
   // 10. Empty job is refused, not printed as blank paper.
   {
@@ -269,6 +274,95 @@ async function* blocksOf(bmp, blockRows) {
     const sim2 = new SimTransport();
     await T.printJob(makeBmp(50, 'black'), 50, {transport: sim2, ...FAST});
     ok(sim2.headReceived && sim2.footReceived && sim2.rowsReceived === 50, 'second job after first completes cleanly');
+  }
+  // 12. Package mode: a 1000-row single image goes out as ONE block, byte-exact.
+  {
+    const bmp = makeBmp(1000, 'random');
+    const sim = new SimTransport(BIGCAP);
+    const r = await T.printJob(bmp, 1000, {transport: sim, ...FAST});
+    ok(sim.segments.map(s => s.rows).join(',') === '1000', 'tall image = 1 package block (got ' + sim.segments.map(s => s.rows).join(',') + ')');
+    ok(r.segments === 1 && eq(sim.raster, bmp), 'tall package reconstructs byte-exact');
+  }
+  // Helper: reconstructed output with feed runs removed (feeds are in
+  // reconstructed coordinates, so stripping them recovers sent data).
+  function stripFeeds(sim) {
+    const rows = sim.raster.length / 48;
+    const feedSet = new Set();
+    for (const f of sim.feeds) for (let y = f.at; y < f.at + f.rows; y++) feedSet.add(y);
+    const out = [];
+    for (let y = 0; y < rows; y++)
+      if (!feedSet.has(y)) for (let x = 0; x < 48; x++) out.push(sim.raster[y * 48 + x]);
+    return new Uint8Array(out);
+  }
+  // 13. BUG REPRODUCTION (the reported issue): with the old 128-row cuts,
+  //     the printer's post-block feed lands INSIDE the image.
+  {
+    const bmp = makeBmp(300, 'stripe'); // stripe rows are never all-zero
+    const sim = new SimTransport({feedRows: 100});
+    await T.printJob(bmp, 300, {transport: sim, ...FAST, maxRows: 128});
+    ok(sim.feeds.length === 3, 'split image triggers 3 post-block feeds (got ' + sim.feeds.length + ')');
+    ok(sim.feeds[0].at === 128, 'first feed at row 128, inside the image span 0-299');
+    let feedBlank = true;
+    for (let y = 128; y < 228; y++)
+      for (let x = 0; x < 48; x++)
+        if (sim.raster[y * 48 + x] !== 0) feedBlank = false;
+    ok(feedBlank, 'rows 128-227 of the output are feed blank, not image data -> shredded');
+  }
+  // 14. THE FIX: two images as packages with a 24-row break between them.
+  //     Feeds land only between images, never inside one.
+  {
+    const img1 = makeBmp(100, 'stripe'), img2 = makeBmp(200, 'black');
+    const brk = new Uint8Array(48 * 24);
+    const total = 100 + 24 + 200;
+    const sim = new SimTransport({...BIGCAP, feedRows: 100});
+    async function* src() { yield img1; yield T.PKG_END; yield brk; yield img2; yield T.PKG_END; }
+    const r = await T.streamRaster(src(), total, {transport: sim, ...FAST});
+    ok(sim.segments.map(s => s.rows).join(',') === '100,224', 'packages: [img1 100, break+img2 224] (got ' + sim.segments.map(s => s.rows).join(',') + ')');
+    ok(sim.feeds.map(f => f.at).join(',') === '100,424', 'feeds at 100 and 424 = package boundaries only (got ' + sim.feeds.map(f => f.at).join(',') + ')');
+    // Image data ranges in reconstructed coordinates: img1 [0,100), img2 [224,424).
+    const overlaps = (a0, a1, b0, b1) => a0 < b1 && b0 < a1;
+    const badFeed = sim.feeds.some(f => overlaps(f.at, f.at + f.rows, 0, 100) || overlaps(f.at, f.at + f.rows, 224, 424));
+    ok(!badFeed, 'no feed overlaps any image data range');
+    const data = stripFeeds(sim);
+    const expect = new Uint8Array(48 * total);
+    expect.set(img1, 0); expect.set(brk, 48 * 100); expect.set(img2, 48 * 124);
+    ok(eq(data, expect), 'data minus feeds == img1 + break + img2, byte-exact');
+    ok(r.sentRows === total, 'package job sentRows == total');
+  }
+  // 15. Split-mode tradeoff, documented: cutting a package reintroduces
+  //     feeds inside the image. Splitting is a fallback, not the default.
+  {
+    const bmp = makeBmp(300, 'stripe');
+    const sim = new SimTransport({feedRows: 100});
+    await T.printJob(bmp, 300, {transport: sim, ...FAST, maxRows: 128});
+    ok(sim.feeds[0].at === 128 && sim.feeds[0].at < 300, 'split package: first feed inside the image span (row 128 < 300)');
+  }
+  // 16. No blank-only block: break rows ride with the FOLLOWING package,
+  //     so no block is all blank (which would waste a feed on nothing).
+  {
+    const img1 = makeBmp(100, 'stripe'), img2 = makeBmp(200, 'black');
+    const brk = new Uint8Array(48 * 24);
+    const sim = new SimTransport({...BIGCAP, feedRows: 100});
+    async function* src() { yield img1; yield T.PKG_END; yield brk; yield img2; yield T.PKG_END; }
+    await T.streamRaster(src(), 324, {transport: sim, ...FAST});
+    let allNonBlank = true;
+    for (const s of sim.segments) {
+      let nz = false;
+      for (let y = s.at; y < s.at + s.rows; y++)
+        for (let x = 0; x < 48; x++)
+          if (sim.raster[y * 48 + x] !== 0) nz = true;
+      if (!nz) allNonBlank = false;
+    }
+    ok(allNonBlank, 'every block contains image data (no blank-only block)');
+  }
+  // 17. Tall-package risk, documented: IF the M02 255-line cap applies to
+  //     the M110, a 1000-row package blanks. That cap is unproven for the
+  //     M110; split mode is the fallback if hardware ever shows it.
+  {
+    const bmp = makeBmp(1000, 'random');
+    const sim = new SimTransport({maxSegmentRows: 255});
+    await T.printJob(bmp, 1000, {transport: sim, ...FAST});
+    ok(sim.discarded && sim.rowsReceived === 0, 'tall package under a 255 cap is discarded (known tradeoff)');
   }
 
   console.log(fails === 0 ? '\nALL ENGINE TESTS PASSED' : '\n' + fails + ' FAILURES');

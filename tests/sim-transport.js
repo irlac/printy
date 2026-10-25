@@ -1,25 +1,31 @@
 // SimTransport — a fake M110 for automated testing (Node, no DOM, no BLE).
 // It parses the byte stream exactly like the printer firmware would:
-//   job head (11 bytes) -> repeated raster segments (8-byte GS v 0 header
+//   job head (11 bytes) -> repeated raster blocks (8-byte GS v 0 header
 //   + 48*rows data) -> footer (8 bytes).
-// It models the one firmware behavior that matters for Printy 2.0:
-// if a single segment declares MORE than maxSegmentRows rows, the whole
-// job is DISCARDED (blank output) — the failure mode of the old engine,
-// which sent every document as one giant segment. The limit is NOT
-// documented for the M110 (the only documented family cap is 255 lines
-// for the M02); the simulator makes the assumption explicit and
-// configurable so tests can prove segmentation fixes it.
+// It models two firmware behaviors that matter for Printy:
+// 1. Discard-over-cap: if a single block declares MORE than
+//    maxSegmentRows rows, the whole job is DISCARDED (blank output).
+//    The limit is NOT documented for the M110 (the only documented
+//    family cap is 255 lines for the M02); the simulator makes the
+//    assumption explicit and configurable.
+// 2. Feed-after-block (observed on real M110 hardware, 2026-10-24, NOT
+//    in any public doc): after every raster block the printer spools
+//    feedRows blank rows (~half an inch, ~100 rows at 8 dots/mm).
+//    Feeds are recorded with their reconstructed row offsets, so tests
+//    can prove a feed lands between images and never inside one.
 'use strict';
 
 class SimTransport {
-  constructor({maxSegmentRows = 255, failAfterBytes = Infinity} = {}) {
+  constructor({maxSegmentRows = 255, feedRows = 0, failAfterBytes = Infinity} = {}) {
     this.connected = true;
     this.maxSegmentRows = maxSegmentRows;
+    this.feedRows = feedRows;
     this.failAfterBytes = failAfterBytes;
     this.bytesReceived = 0;
     this.writes = [];          // raw writes, in order
-    this.raster = new Uint8Array(0); // reconstructed printed rows (48 B each)
-    this.segments = [];        // {rows} per accepted segment
+    this.raster = new Uint8Array(0); // reconstructed output (48 B/row), feeds included
+    this.segments = [];        // {rows, at} per accepted block (at = reconstructed row offset)
+    this.feeds = [];           // {at, rows} per post-block feed (reconstructed row offsets)
     this.headReceived = false;
     this.footReceived = false;
     this.discarded = false;    // true once the firmware gave up on the job
@@ -80,6 +86,7 @@ class SimTransport {
             this.discarded = true;
             this.raster = new Uint8Array(0);
             this.segments = [];
+            this.feeds = [];
             this._state = 'discarded';
             return;
           }
@@ -93,9 +100,17 @@ class SimTransport {
         const need = this._pendingRows * 48;
         if (this._buf.length < need) return;
         const data = this._take(need);
+        const at = this.raster.length / 48;
         const nb = new Uint8Array(this.raster.length + data.length);
         nb.set(this.raster); nb.set(data, this.raster.length); this.raster = nb;
-        this.segments.push({rows: this._pendingRows});
+        this.segments.push({rows: this._pendingRows, at});
+        if (this.feedRows > 0) {
+          const feedAt = this.raster.length / 48;
+          const fb = new Uint8Array(this.raster.length + this.feedRows * 48);
+          fb.set(this.raster); // rest stays zero = blank feed rows
+          this.raster = fb;
+          this.feeds.push({at: feedAt, rows: this.feedRows});
+        }
         this._state = 'header';
       } else {
         return; // done / discarded

@@ -236,10 +236,10 @@ details.how summary{cursor:pointer;color:var(--ink)}
     <div class="row">
       <label>density <select id="density"><option value="8">8</option><option value="10" selected>10</option><option value="12">12</option><option value="15">15</option></select></label>
       <label>write <select id="writeMode"><option value="auto" selected>auto</option><option value="noresp">no-resp only</option><option value="resp">with-resp only</option></select></label>
-      <label>segment <select id="segRows"><option value="64">64 rows</option><option value="128" selected>128 rows</option><option value="255">255 rows</option></select></label>
+      <label>split <select id="splitRows"><option value="never" selected>never</option><option value="255">255 rows</option><option value="128">128 rows</option><option value="64">64 rows</option></select></label>
     </div>
     <p class="hint">Settings save automatically. If chunks send but nothing prints, try “with-resp only” + 20 B chunks.</p>
-    <p class="hint">Engine 2.0: long jobs are split into segments (one print command each, default 128 rows) so tall documents can't blank out. A segment is not a BLE chunk and not a job — segments share one init and one footer, so the strip stays continuous.</p>
+    <p class="hint">Package mode: each image prints as one print command, because the M110 feeds ~half an inch after every print command — cutting an image across commands shreds it with gaps. "Split" only cuts images taller than the chosen size, as a fallback for very tall images that might otherwise print blank; split images may show gaps.</p>
   </div>
   <div class="card">
     <h2>🕘 Recent prints</h2>
@@ -260,12 +260,15 @@ details.how summary{cursor:pointer;color:var(--ink)}
 <section id="tab-queue" class="tab">
   <div class="card">
     <h2>🧾 Print queue</h2>
-    <p class="hint">Stack images and PDFs into one continuous strip. The whole queue prints as a single job — one init, one footer, no gaps — through the segmented engine.</p>
+    <p class="hint">Stack images and PDFs into one strip. Each image (or PDF page) prints whole as one package, with an automatic line break between packages — the printer's own feed lands in the break, never inside an image.</p>
     <div id="queueDrop" class="paper" style="border:2px dashed #999;padding:18px;text-align:center;cursor:pointer">
       <p style="margin:0">📂 Drop files here, or <label class="btn" style="cursor:pointer">choose files<input type="file" id="queueFile" accept="image/*,.pdf,.bmp" multiple style="display:none"></label></p>
       <p class="hint" style="margin:6px 0 0">PNG · JPEG · WebP · GIF (first frame) · BMP · multi-page PDF</p>
     </div>
     <div id="queueList" style="margin-top:12px"></div>
+    <div class="row" style="margin-top:12px">
+      <label>break between images <input id="queueBreak" type="number" min="0" max="480" value="24" style="width:64px"> rows</label>
+    </div>
     <div class="row" style="margin-top:12px">
       <button class="primary" id="queuePrepareBtn" onclick="queuePrepare()">🔍 Prepare queue</button>
       <button class="primary" id="queueStartBtn" onclick="queueStart()" disabled>🖨️ Start printing</button>
@@ -282,7 +285,7 @@ details.how summary{cursor:pointer;color:var(--ink)}
     <div style="max-height:420px;overflow:auto;border:1px solid #ccc;background:#fff">
       <canvas id="queuePrev" width="192" height="120" style="display:block;margin:0 auto"></canvas>
     </div>
-    <p class="hint">Preview is a half-scale strip of the assembled queue (truncated at 4000px). Spacing rows go between documents, not after the last one. PDFs need network once to load the PDF engine — everything else works offline.</p>
+    <p class="hint">Preview is a half-scale strip of the assembled queue (truncated at 4000px). Automatic breaks go between images (and PDF pages), spacing rows go between documents, neither after the last one. PDFs need network once to load the PDF engine — everything else works offline.</p>
   </div>
 </section>
 
@@ -331,11 +334,11 @@ function switchTab(id){
 function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}
 
 /* ---------------- settings (persisted) ---------------- */
-const settings=Object.assign({chunkSize:'64',chunkDelay:'40',density:'10',mediaType:'11',writeMode:'auto',segRows:'128'},
+const settings=Object.assign({chunkSize:'64',chunkDelay:'40',density:'10',mediaType:'11',writeMode:'auto',splitRows:'never'},
   JSON.parse(localStorage.getItem('ts_settings')||'{}'));
 function applySettings(){for(const k of Object.keys(settings)){const el=$(k);if(el)el.value=settings[k];}}
 function saveSettings(){for(const k of Object.keys(settings)){const el=$(k);if(el)settings[k]=el.value;}localStorage.setItem('ts_settings',JSON.stringify(settings));}
-['chunkSize','chunkDelay','density','mediaType','writeMode','segRows'].forEach(id=>{
+['chunkSize','chunkDelay','density','mediaType','writeMode','splitRows'].forEach(id=>{
   document.addEventListener('change',e=>{if(e.target&&e.target.id===id)saveSettings();});
 });
 
@@ -404,18 +407,21 @@ async function queryPrinter(){
     else log('got '+lastNotify.length+' reply packet(s) — write path is alive');
   }catch(e){log('❌ query failed: '+errText(e));}
 }
-/* ================= Print Engine 2.0 =================
+/* ================= Print Engine (package mode) =================
    Three levels, three different limits — do not conflate them:
    - JOB: one physical printout. Exactly one init block at the start
      (speed + density + media) and exactly one footer at the end.
-     A job may contain any number of segments.
-   - SEGMENT: one GS v 0 raster command = 8-byte header + up to
-     segmentRows rows (48 bytes each). The printer only has to absorb
-     one segment at a time. This is the fix for blank output on tall
-     documents: the old engine sent the whole document as ONE segment,
-     and no public source verifies the M110 firmware accepts an
-     arbitrarily tall single block (the only documented block cap in
-     this printer family is 255 lines). Default 128 rows, configurable.
+     A job may contain any number of packages.
+   - PACKAGE: one image = one GS v 0 raster command = 8-byte header +
+     the image's rows (48 bytes each). The M110 feeds ~half an inch
+     after every raster block, so a block boundary inside an image
+     shreds it with a gap; boundaries belong ONLY between images.
+     This replaced 2.0's fixed 128-row segmentation, which shredded
+     tall images on real hardware. A package is never cut by default;
+     the Split setting only cuts packages taller than its value, as
+     a fallback for very tall images that might otherwise print
+     blank (no public source proves an M110 block cap; the only
+     documented family cap is 255 lines, M02 docs).
    - CHUNK: one BLE GATT write (<= chunkBytes). Pure transport
      packetization; the printer never sees chunk boundaries.
    Write completion is NOT print completion: a resolved GATT write only
@@ -452,7 +458,7 @@ const bleTransport={
    presses Start) -> printing. Pause is only honoured between segments,
    never mid-segment: a printer left waiting mid-raster may time out
    and discard the block. */
-const engineState={state:'idle',label:'',sentRows:0,totalRows:0,segments:0,totalSegments:0,error:null};
+const engineState={state:'idle',label:'',sentRows:0,totalRows:0,segments:0,error:null};
 function setEngineState(s,patch){
   engineState.state=s;
   if(patch)Object.assign(engineState,patch);
@@ -462,8 +468,8 @@ function renderEngineStatus(){
   const el=$('jobStateLine');if(!el)return;
   const st=engineState;
   let t='idle';
-  if(st.state==='printing')t=`🖨️ printing — ${st.sentRows}/${st.totalRows} rows · segment ${st.segments}/${st.totalSegments}`;
-  else if(st.state==='paused')t=`⏸️ paused — ${st.sentRows}/${st.totalRows} rows sent (printer is waiting between segments)`;
+  if(st.state==='printing')t=`🖨️ printing — ${st.sentRows}/${st.totalRows} rows · block ${st.segments}`;
+  else if(st.state==='paused')t=`⏸️ paused — ${st.sentRows}/${st.totalRows} rows sent (printer is waiting between blocks)`;
   else if(st.state==='preparing')t='⏳ preparing…';
   else if(st.state==='ready')t=`✅ ready — ${st.totalRows} rows · press Start to print`;
   else if(st.state==='completed')t=`✅ completed — ${st.sentRows} rows sent (printer may still be feeding)`;
@@ -498,14 +504,34 @@ async function sendSegment(transport,segBytes,rows,cfg,ctl){
   await sleep(30);
   await writeChunked(transport,segBytes,cfg.chunkBytes,cfg.gapMs,ctl);
 }
-/* Core segmented sender. blocks = async iterable of Uint8Array row data
-   (each block a multiple of 48 bytes). Returns {sentRows,segments}.
-   Throws on transport failure; returns {cancelled:true} on cancel. */
+/* Package boundary marker yielded by row streams: everything since the
+   previous marker (or job start) is one image and must go out as one
+   raster block. The M110 feeds ~half an inch after every raster block,
+   so a block boundary inside an image shreds it with a gap; boundaries
+   belong only between images. Plain blank rows yielded after a marker
+   belong to the NEXT package, so the post-block feed lands in the
+   break, never inside image data. */
+const PKG_END=Object.freeze({pkgEnd:true});
+/* Split threshold from the Printer tab: 'never' (default) means a
+   package is never cut; a number means packages taller than that are
+   cut into blocks of that size (fallback for very tall images that
+   might otherwise print blank — cut images may show gaps). */
+function splitMaxRows(){
+  const v=$('splitRows')&&$('splitRows').value;
+  if(!v||v==='never')return Infinity;
+  return +v||Infinity;
+}
+/* Core package sender. blocks = async iterable of Uint8Array row data
+   (each a multiple of 48 bytes) plus PKG_END markers. Returns
+   {sentRows,segments}. Throws on transport failure; returns
+   {cancelled:true} on cancel. Pause is honoured only between blocks,
+   never mid-block: a printer left waiting mid-raster may time out
+   and discard the block. */
 async function streamRaster(blocks,totalRows,opts={}){
   const transport=opts.transport||bleTransport;
   const ctl=opts.ctl||makeJobCtl();
   const cfg={
-    segmentRows:opts.segmentRows||128,
+    maxRows:opts.maxRows==null?Infinity:opts.maxRows,
     chunkBytes:opts.chunkBytes||64,
     gapMs:opts.gapMs==null?40:opts.gapMs,
     density:opts.density==null?10:opts.density,
@@ -516,34 +542,38 @@ async function streamRaster(blocks,totalRows,opts={}){
   if(engineState.state==='printing'||engineState.state==='paused')
     throw new Error('already printing — wait for the current job');
   setEngineState('printing',{label:opts.label||'',sentRows:0,totalRows,
-    segments:0,totalSegments:Math.ceil(totalRows/cfg.segmentRows),error:null});
+    segments:0,error:null});
   printing=true;
   let sentRows=0,segments=0;
   try{
     await writeHead(transport,cfg,ctl);
     let pending=new Uint8Array(0);
-    const segBytes=cfg.segmentRows*48;
-    const sendOneSegment=async()=>{
-      const n=Math.min(cfg.segmentRows,pending.length/48);
-      if(n<=0)return;
-      const seg=pending.slice(0,n*48);
-      pending=pending.slice(n*48);
-      await waitWhilePaused(ctl);
-      if(ctl.cancelled)throw new CancelledError();
-      await sendSegment(transport,seg,n,cfg,ctl);
-      sentRows+=n;segments++;
-      setEngineState('printing',{sentRows,segments});
-      if(opts.onProgress)opts.onProgress(sentRows,totalRows);
+    /* Flush the pending package in blocks of at most maxRows rows.
+       With maxRows Infinity (the default) a package goes out as ONE
+       raster block, so the printer's post-block feed lands between
+       packages, never inside an image. */
+    const flushPackage=async()=>{
+      while(pending.length>0){
+        const n=Math.min(cfg.maxRows,pending.length/48);
+        const seg=pending.slice(0,n*48);
+        pending=pending.slice(n*48);
+        await waitWhilePaused(ctl);
+        if(ctl.cancelled)throw new CancelledError();
+        await sendSegment(transport,seg,n,cfg,ctl);
+        sentRows+=n;segments++;
+        setEngineState('printing',{sentRows,segments});
+        if(opts.onProgress)opts.onProgress(sentRows,totalRows);
+      }
     };
     for await(const block of blocks){
+      if(block&&block.pkgEnd){await flushPackage();continue;}
       if(block.length%48!==0)throw new Error('row block is not 48-byte aligned');
       const nb=new Uint8Array(pending.length+block.length);
       nb.set(pending);nb.set(block,pending.length);pending=nb;
-      while(pending.length>=segBytes)await sendOneSegment();
     }
-    while(pending.length>0)await sendOneSegment();
+    await flushPackage();
     if(sentRows!==totalRows)throw new Error('row count mismatch: sent '+sentRows+', expected '+totalRows);
-    /* footer exactly once, at the very end — never between segments */
+    /* footer exactly once, at the very end — never between packages */
     await sleep(300);
     if(ctl.cancelled)throw new CancelledError();
     await writeChunked(transport,JOB_FOOT,cfg.chunkBytes,0,ctl);
@@ -561,18 +591,18 @@ async function streamRaster(blocks,totalRows,opts={}){
     printing=false;
   }
 }
-/* Legacy-compatible entry: one in-memory bitmap, sent segmented.
+/* Legacy-compatible entry: one in-memory bitmap, sent as one package.
    All existing print buttons go through here now. opts may carry
-   onProgress, ctl, transport, segmentRows, chunkBytes, gapMs, label. */
+   onProgress, ctl, transport, maxRows, chunkBytes, gapMs, label. */
 async function printJob(bmp,h,opts={}){
   const cfg={
-    segmentRows:opts.segmentRows||+($('segRows')&&$('segRows').value||128),
+    maxRows:opts.maxRows==null?splitMaxRows():opts.maxRows,
     chunkBytes:opts.chunkBytes||+($('chunkSize')&&$('chunkSize').value||64),
     gapMs:opts.gapMs==null?(+($('chunkDelay')&&$('chunkDelay').value||40)):opts.gapMs,
     density:opts.density||+($('density')&&$('density').value||10),
     media:opts.media==null?(+($('mediaType')&&$('mediaType').value||0x0b)):opts.media,
   };
-  async function* oneBlock(){yield bmp;}
+  async function* oneBlock(){yield bmp;yield PKG_END;}
   return streamRaster(oneBlock(),h,Object.assign({},opts,cfg));
 }
 function buildJob(bmp,h,media){
@@ -2252,10 +2282,26 @@ async function* renderSourceRows(src,geom,opts){
     yield packBitsFromBin(ditherBand(gray,bh),384,bh);
   }
 }
-/* The queue's row stream: items in order, spacing between (not after last) */
+/* Automatic line break between packages (rows, default 24). Read live
+   for the stream; Prepare freezes the value on the prepared job so the
+   row total it promises is exactly what prints. */
+function queueBreakRows(){
+  const v=$('queueBreak')&&$('queueBreak').value;
+  if(v===''||v==null)return 24;
+  const n=Math.floor(+v);
+  return Number.isFinite(n)?Math.max(0,Math.min(480,n)):24;
+}
+/* The queue's row stream: each image (or PDF page) is one package.
+   A PKG_END marker closes the package; the automatic break rows and
+   the per-item spacing rows that follow belong to the NEXT package,
+   so no blank-only block is ever sent and the printer's post-block
+   feed lands in the break, never inside an image. Breaks go between
+   packages, spacing between documents, neither after the last one. */
 async function* queueRowStream(prepared){
+  const brk=(prepared.breakRows==null?queueBreakRows():prepared.breakRows);
   for(let i=0;i<prepared.items.length;i++){
     const pi=prepared.items[i],item=pi.item;
+    const lastItem=(i===prepared.items.length-1);
     if(item.kind==='pdf'){
       const doc=await loadPdfDoc(item);
       for(let k=0;k<pi.pages.length;k++){
@@ -2264,15 +2310,25 @@ async function* queueRowStream(prepared){
         const cv=newCanvas(384,Math.round(v0.height*384/v0.width));
         await page.render({canvasContext:cv.getContext('2d'),viewport:page.getViewport({scale:384/v0.width})}).promise;
         yield* renderSourceRows(cv,pi.geoms[k],item);
+        yield PKG_END;
+        if(!(lastItem&&k===pi.pages.length-1)){
+          if(brk>0)yield new Uint8Array(48*brk);
+          if(k===pi.pages.length-1){
+            const sp=item.spacingRows||0;
+            if(sp>0)yield new Uint8Array(48*sp);
+          }
+        }
       }
     }else{
       const img=await queueLoadImage(item.file);
       try{yield* renderSourceRows(img.src,pi.geom,item);}
       finally{img.close();}
-    }
-    if(i<prepared.items.length-1){
-      const sp=item.spacingRows||0;
-      if(sp>0)yield new Uint8Array(48*sp);
+      yield PKG_END;
+      if(!lastItem){
+        if(brk>0)yield new Uint8Array(48*brk);
+        const sp=item.spacingRows||0;
+        if(sp>0)yield new Uint8Array(48*sp);
+      }
     }
   }
 }
@@ -2321,6 +2377,10 @@ async function queuePrepare(){
     }
     for(let i=0;i<prepared.items.length-1;i++)
       prepared.totalRows+=prepared.items[i].item.spacingRows||0;
+    let packages=0;
+    for(const pi of prepared.items)packages+=pi.item.kind==='pdf'?pi.pages.length:1;
+    prepared.breakRows=queueBreakRows();
+    if(packages>1)prepared.totalRows+=prepared.breakRows*(packages-1);
     if(prepared.totalRows<=0)throw new Error('queue renders to zero rows');
     queuePrepared=prepared;
     await queueRenderPreview(prepared);
@@ -2328,8 +2388,7 @@ async function queuePrepare(){
     $('queueSummary').textContent=
       prepared.items.length+' document(s) · '+prepared.totalRows+' rows · ~'+
       queueEstimateText(prepared.totalRows)+' at current pacing';
-    setEngineState('ready',{totalRows:prepared.totalRows,sentRows:0,segments:0,
-      totalSegments:Math.ceil(prepared.totalRows/(+($('segRows')&&$('segRows').value||128)))});
+    setEngineState('ready',{totalRows:prepared.totalRows,sentRows:0,segments:0});
     $('queueStartBtn').disabled=false;
     log('🧾 queue ready: '+prepared.totalRows+' rows');
   }catch(e){
@@ -2417,7 +2476,7 @@ async function queueStart(){
   try{
     const r=await streamRaster(queueRowStream(queuePrepared),total,{
       ctl:queueCtl,label:'queue',
-      segmentRows:+($('segRows')&&$('segRows').value||128),
+      maxRows:splitMaxRows(),
       chunkBytes:+($('chunkSize')&&$('chunkSize').value||64),
       gapMs:+($('chunkDelay')&&$('chunkDelay').value||40),
       density:+($('density')&&$('density').value||10),

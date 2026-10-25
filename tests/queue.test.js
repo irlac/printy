@@ -2,7 +2,8 @@
 // Covers the queue pipeline without a printer or network:
 // page-selection parsing, shared geometry, banded dither equivalence
 // (no seam), banded row rendering, trim scanning, and full queue
-// stream assembly (items + spacing, in order, exact row counts).
+// stream assembly (packages + automatic breaks, in order, exact row
+// counts, feeds only between packages).
 'use strict';
 const T = require('./harness.js').loadApp();
 const {SimTransport} = require('./sim-transport.js');
@@ -10,7 +11,8 @@ const {SimTransport} = require('./sim-transport.js');
 let fails = 0;
 const ok = (c, msg) => { if (!c) { fails++; console.log('FAIL:', msg); } else console.log('ok:', msg); };
 const eq = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
-const FAST = {gapMs: 0, chunkBytes: 1024, segmentRows: 128};
+const FAST = {gapMs: 0, chunkBytes: 1024};
+const BIGCAP = {maxSegmentRows: 100000};
 
 function grayGradient(w, h) {
   const g = new Float32Array(w * h);
@@ -104,8 +106,9 @@ function grayGradient(w, h) {
     bc.fillStyle = '#fff'; bc.fillRect(0, 0, 100, 100);
     ok((await T.scanSourceBbox(blank, 100, 100)) === null, 'trim bbox null on all-white');
   }
-  // 6. Full queue stream: 2 images + spacing, exact rows, spacing is zeros,
-  //    and the whole thing prints through the segmented engine.
+  // 6. Full queue stream: 2 images as packages + automatic break +
+  //    spacing, exact rows, feeds only between packages, and the whole
+  //    thing prints through the package engine.
   {
     const fakeFile = (name) => ({name, type: 'image/png'});
     const item1 = {kind: 'image', file: fakeFile('a.png'), scalePct: 100, dither: 'floyd', bright: 0, contrast: 0, invert: false, trim: false, spacingRows: 24};
@@ -113,25 +116,40 @@ function grayGradient(w, h) {
     // harness Image stub is 200x150 for every file
     const g1 = T.queueGeom(200, 150, null, 100); // 384x288
     const g2 = T.queueGeom(200, 150, null, 50);  // 192x144
+    // total: img1 288 + break 24 + spacing 24 + img2 144
     const prepared = {items: [
       {item: item1, geom: g1, rows: g1.dh},
       {item: item2, geom: g2, rows: g2.dh},
-    ], totalRows: g1.dh + 24 + g2.dh};
-    const sim = new SimTransport();
+    ], totalRows: g1.dh + 24 + 24 + g2.dh, breakRows: 24};
+    const sim = new SimTransport({...BIGCAP, feedRows: 100});
     const r = await T.streamRaster(T.queueRowStream(prepared), prepared.totalRows, {transport: sim, ...FAST});
     ok(r.sentRows === prepared.totalRows, 'queue stream sentRows == total (' + r.sentRows + ' vs ' + prepared.totalRows + ')');
-    ok(sim.rowsReceived === prepared.totalRows, 'simulator received all queue rows');
-    // spacing block: rows g1.dh .. g1.dh+23 must be all zero
-    let spacingZero = true;
-    for (let y = g1.dh; y < g1.dh + 24; y++)
+    ok(sim.segments.map(s => s.rows).join(',') === '288,192', 'queue packages: [img1 288, break+spacing+img2 192] (got ' + sim.segments.map(s => s.rows).join(',') + ')');
+    // strip feeds to recover sent data in data coordinates
+    const feedSet = new Set();
+    for (const f of sim.feeds) for (let y = f.at; y < f.at + f.rows; y++) feedSet.add(y);
+    const data = [];
+    for (let y = 0; y < sim.raster.length / 48; y++)
+      if (!feedSet.has(y)) for (let x = 0; x < 48; x++) data.push(sim.raster[y * 48 + x]);
+    const dataRows = new Uint8Array(data);
+    ok(dataRows.length === 48 * prepared.totalRows, 'data minus feeds == total rows');
+    // break + spacing block: data rows g1.dh .. g1.dh+47 must be all zero
+    let blankMid = true;
+    for (let y = g1.dh; y < g1.dh + 48; y++)
       for (let x = 0; x < 48; x++)
-        if (sim.raster[y * 48 + x] !== 0) spacingZero = false;
-    ok(spacingZero, 'spacing rows are blank (24 rows of zeros between items)');
+        if (dataRows[y * 48 + x] !== 0) blankMid = false;
+    ok(blankMid, 'break + spacing rows are blank (48 rows of zeros between items)');
     // second item actually rendered (not blank)
     let black2 = 0;
-    for (let y = g1.dh + 24; y < prepared.totalRows; y++)
-      for (let x = 0; x < 48; x++) if (sim.raster[y * 48 + x]) black2++;
+    for (let y = g1.dh + 48; y < prepared.totalRows; y++)
+      for (let x = 0; x < 48; x++) if (dataRows[y * 48 + x]) black2++;
     ok(black2 > 0, 'second item rendered content (non-blank)');
+    // feeds in reconstructed coordinates: seg1 [0,288), feed [288,388),
+    // seg2 [388,580) = break [388,412) + spacing [412,436) + img2 [436,580).
+    // No feed may overlap img1 data [0,288) or img2 data [436,580).
+    const overlaps = (a0, a1, b0, b1) => a0 < b1 && b0 < a1;
+    const badFeed = sim.feeds.some(f => overlaps(f.at, f.at + f.rows, 0, 288) || overlaps(f.at, f.at + f.rows, 436, 580));
+    ok(!badFeed, 'no feed overlaps any image data range (feeds at ' + sim.feeds.map(f => f.at).join(',') + ')');
     ok(!sim.discarded && sim.footReceived, 'queue job parses clean with foot');
   }
   // 7. Queue kind detection

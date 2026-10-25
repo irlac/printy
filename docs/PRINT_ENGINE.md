@@ -1,5 +1,12 @@
 # Print Engine 2.0 — diagnosis, architecture, limitations, tests
 
+> Update (2026-10-24): §2's fixed 128-row segmentation is superseded by
+> **package mode** (§5). The M110 feeds ~half an inch after every raster
+> block, so cutting an image across blocks shreds it with gaps. Each
+> image is now one raster block; automatic line breaks go between
+> images only. The 2.0 history below is kept because the blank-output
+> diagnosis and the tall-image tradeoff still stand.
+
 ## 1. The diagnosed failure
 
 ### Symptom
@@ -256,6 +263,117 @@ the only results that can confirm the inferred behaviors:
    complete rows is hardware, blank is protocol.
 7. **Segment size sweep (optional):** repeat #3 at 255-row segments;
    if it blanks, the M110 ceiling is below 255 — stay at 128.
+
+## 5. Package mode — the feed-after-block correction (2026-10-24)
+
+### The finding
+
+Hardware testing of Engine 2.0 showed a behavior no public source
+documents: **when a raster block stops printing, the M110 spools
+about half an inch** (~100 rows at 8 dots/mm). Under 2.0's fixed
+segmentation, a block boundary falls every 128 rows with no regard
+for image boundaries, and queue segments routinely straddle two
+images. The spool therefore lands *inside* images every 128 rows,
+shredding them into strips separated by blank gaps. The queue made
+it worse, not better: the strip was continuous in bytes but broken
+on paper.
+
+This is an observed hardware behavior, not a documented protocol
+fact. The search for a public source (manuals, phomemo-tools,
+pyphomemo, phomymo) found nothing about mid-job auto-feed on
+continuous media — the manuals only mention feed-on-load calibration
+for gap paper. The mechanism is inferred from the observation plus
+the code: the only within-image boundaries the engine creates are
+raster-block boundaries, so the feed must follow block ends.
+
+### The design
+
+- **A package is one image.** Every image (and every PDF page, which
+  is an image) goes out as exactly one GS v 0 block, regardless of
+  height. Row streams mark package ends with a `PKG_END` marker; the
+  engine flushes only on markers (or end of stream), never on a row
+  count.
+- **Automatic line breaks go between packages.** The queue inserts a
+  break (default 24 blank rows, adjustable in the Queue tab) between
+  consecutive packages, plus any per-item spacing. Break and spacing
+  rows are yielded *after* the package-end marker, so they belong to
+  the *next* package's block: no blank-only block is ever sent (which
+  would waste a feed on nothing), and the printer's post-block feed
+  lands in the break zone, never inside image data.
+- **Splitting is opt-in, not default.** The Printer tab's old
+  segment-size control is now "Split": `never` (default), 255, 128,
+  or 64 rows. It only cuts packages taller than the chosen size, as
+  a fallback for very tall images. The setting key changed, so the
+  old 128-row default does not carry over — everyone gets `never`
+  unless they choose otherwise.
+- **Direct prints are packages too.** Studio, Image Lab, Danbooru,
+  Chaos pieces and reprints each send their bitmap as one block.
+  Chaos pieces were already separate jobs, so each already had its
+  own feed as separation; nothing changes for them except tall
+  pieces no longer split.
+
+### The tradeoff, stated plainly
+
+Package mode and the original blank-output problem pull in opposite
+directions, and both caps are unproven for the M110:
+
+- If the M02 255-line cap *does* apply to the M110, a package taller
+  than 255 rows may print blank — the exact failure 2.0 was built to
+  avoid. That is now the known risk of the default.
+- If it does *not* apply, packages print whole at any height and
+  2.0's segmentation was pure cost.
+
+The honest resolution is a hardware test, not a theory: print a tall
+image (500+ rows) as one package. If it prints whole, the cap does
+not bind and package mode is strictly better. If it blanks, the cap
+is real, and the right rule becomes "package, unless taller than the
+proven cap, then split" — with splitting's gaps accepted only for
+those images. Until that test runs, `never` is the default because
+shredding is observed and blanking-on-tall-block is not (for the
+M110 specifically).
+
+### Pause granularity change
+
+Pause is still honoured only between blocks, never mid-block (a
+printer left waiting mid-raster may time out and discard the block).
+Under package mode a block is a whole image, so pausing during a
+large package waits until that package finishes *sending* (at the
+standard pacing, roughly 30 rows/second — a 500-row package takes
+~15 s to send). The status line now reports the block count without
+a total, since the block total is not known until the stream ends.
+
+### Package-mode test results (simulated, all pass)
+
+The simulator gained the observed behavior: after every block it
+inserts `feedRows` blank rows (default 100, the observed half inch)
+and records each feed's row offset, so tests prove where feeds land:
+
+| Case | Result |
+|---|---|
+| Bug reproduction: 300-row image cut at 128 | Feeds at rows 128, 356, 500 — the first feed lands inside the image span (0–299) and rows 128–227 of the output are feed blank, not image data. The reported shredding, reproduced. |
+| Fix: 2 images + 24-row break as packages | Blocks [100, break+img2 224]; feeds at 100 and 424 — package boundaries only; no feed overlaps any image data range; data minus feeds is byte-exact. |
+| Tall image as one package (1000 rows) | Exactly 1 block, byte-exact (uncapped simulator). |
+| Split-mode tradeoff (300 rows, split at 128) | First feed inside the image span — splitting shreds, as documented. |
+| No blank-only block | Every block contains image data; breaks ride with the following package. |
+| Tall package under a 255 cap | Discarded (blank) — the known tradeoff, documented, not hidden. |
+| Full queue stream (2 images, break + spacing) | Blocks [288, 192]; feeds at 288 and 580; break + spacing blank; second image non-blank; foot received. |
+| Original app suite (Studio, Labels, Image, Danbooru, Chaos) | 69/69 checks pass against the new code. |
+
+### Hardware tests still needed (updated)
+
+1. **The tall-package test (decisive):** print a 500+ row image as
+   one package. Whole = the cap does not bind, package mode wins.
+   Blank = the cap is real, and splitting returns for tall images.
+2. **Package seam:** print a 2-image queue. Expected: each image
+   whole, one clean break between them (spool + break rows), no
+   gaps inside either image.
+3. **Break size:** tune the Queue tab's break value to taste — the
+   spool already separates packages, so the break rows are just a
+   top-up, not the whole separation.
+4. **Pause during a large package:** confirm the pause lands after
+   the package finishes sending, with no lost or duplicated rows.
+5. **Split fallback (only if test 1 blanks):** repeat test 1 with
+   Split at 255, then 128, and note which size prints whole.
 
 ### A note on the one test bug found
 
