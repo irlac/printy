@@ -22,7 +22,9 @@ Stack files into one continuous strip and print them as a single job:
   preview strip, and reports total rows + estimated time. Each image
   (or PDF page) prints whole as one package, with an automatic line
   break between packages — the printer's own feed lands in the break,
-  never inside an image. The job then sits in state **Ready** until
+  never inside an image. Packages taller than the Split size (Printer
+  tab, default 255 rows) are cut into back-to-back blocks, so tall
+  images print instead of blanking. The job then sits in state **Ready** until
   you press **Start printing**.
 - **Pause** stops between raster segments (never mid-segment);
   **Resume** continues exactly where it stopped; **Cancel** stops

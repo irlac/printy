@@ -4,10 +4,14 @@
 //   + 48*rows data) -> footer (8 bytes).
 // It models two firmware behaviors that matter for Printy:
 // 1. Discard-over-cap: if a single block declares MORE than
-//    maxSegmentRows rows, the whole job is DISCARDED (blank output).
-//    The limit is NOT documented for the M110 (the only documented
-//    family cap is 255 lines for the M02); the simulator makes the
-//    assumption explicit and configurable.
+//    maxSegmentRows rows, THAT BLOCK is discarded (blank) and the
+//    job CONTINUES with the next block — observed on real hardware
+//    2026-10-24 (3-package queue: oversize first package blank, the
+//    other two printed). The limit is NOT documented for the M110
+//    (the only documented family cap is 255 lines for the M02); the
+//    simulator makes the assumption explicit and configurable.
+//    A discarded block contributes no rows and no feed: the model
+//    assumes nothing printed means nothing to present.
 // 2. Feed-after-block (observed on real M110 hardware, 2026-10-24, NOT
 //    in any public doc): after every raster block the printer spools
 //    feedRows blank rows (~half an inch, ~100 rows at 8 dots/mm).
@@ -24,15 +28,16 @@ class SimTransport {
     this.bytesReceived = 0;
     this.writes = [];          // raw writes, in order
     this.raster = new Uint8Array(0); // reconstructed output (48 B/row), feeds included
-    this.segments = [];        // {rows, at} per accepted block (at = reconstructed row offset)
+    this.segments = [];        // {rows, at} per accepted block, {rows, blank:true, at:null} per discarded block
     this.feeds = [];           // {at, rows} per post-block feed (reconstructed row offsets)
     this.headReceived = false;
     this.footReceived = false;
-    this.discarded = false;    // true once the firmware gave up on the job
+    this.discarded = false;    // true once any block was discarded (blanked)
     this.parseError = null;
     this._buf = new Uint8Array(0);
     this._state = 'head';      // head -> header -> data -> header ... -> foot
     this._pendingRows = 0;
+    this._skipData = false;    // true while consuming a discarded block's bytes
   }
 
   async write(bytes) {
@@ -43,7 +48,7 @@ class SimTransport {
     }
     this.bytesReceived += bytes.length;
     this.writes.push(bytes);
-    if (this.discarded || this._state === 'done') return; // printer ignores the rest
+    if (this._state === 'done') return; // printer ignores the rest
     const nb = new Uint8Array(this._buf.length + bytes.length);
     nb.set(this._buf); nb.set(bytes, this._buf.length); this._buf = nb;
     this._parse();
@@ -82,13 +87,13 @@ class SimTransport {
           this._pendingRows = h[6] | (h[7] << 8);
           if (this._pendingRows <= 0) { this.parseError = 'zero-row segment'; this._state = 'done'; return; }
           if (this._pendingRows > this.maxSegmentRows) {
-            // Firmware gives up on the whole job: blank output.
+            // Oversize block: blank THIS block, consume its bytes,
+            // keep parsing — the job continues (observed 2026-10-24).
             this.discarded = true;
-            this.raster = new Uint8Array(0);
-            this.segments = [];
-            this.feeds = [];
-            this._state = 'discarded';
-            return;
+            this.segments.push({rows: this._pendingRows, blank: true, at: null});
+            this._skipData = true;
+            this._state = 'data';
+            continue;
           }
           this._state = 'data';
         } else {
@@ -100,6 +105,7 @@ class SimTransport {
         const need = this._pendingRows * 48;
         if (this._buf.length < need) return;
         const data = this._take(need);
+        if (this._skipData) { this._skipData = false; this._state = 'header'; continue; }
         const at = this.raster.length / 48;
         const nb = new Uint8Array(this.raster.length + data.length);
         nb.set(this.raster); nb.set(data, this.raster.length); this.raster = nb;
@@ -113,7 +119,7 @@ class SimTransport {
         }
         this._state = 'header';
       } else {
-        return; // done / discarded
+        return; // done
       }
     }
   }

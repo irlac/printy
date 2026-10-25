@@ -152,7 +152,35 @@ function grayGradient(w, h) {
     ok(!badFeed, 'no feed overlaps any image data range (feeds at ' + sim.feeds.map(f => f.at).join(',') + ')');
     ok(!sim.discarded && sim.footReceived, 'queue job parses clean with foot');
   }
-  // 7. Queue kind detection
+  // 7. Cap-split reality (default Split=255): the same 288-row image
+  //    is cut into [255,33] — so a feed DOES land inside it at row
+  //    255. Documented, not hidden: this is the price of never
+  //    blanking, and the zero-gap continuation is the attempt to
+  //    make that feed not happen on hardware. Data still exact.
+  {
+    const fakeFile = (name) => ({name, type: 'image/png'});
+    const item1 = {kind: 'image', file: fakeFile('a.png'), scalePct: 100, dither: 'floyd', bright: 0, contrast: 0, invert: false, trim: false, spacingRows: 24};
+    const item2 = {kind: 'image', file: fakeFile('b.png'), scalePct: 50, dither: 'threshold', bright: 0, contrast: 0, invert: false, trim: false, spacingRows: 0};
+    const g1 = T.queueGeom(200, 150, null, 100); // 384x288
+    const g2 = T.queueGeom(200, 150, null, 50);  // 192x144
+    const prepared = {items: [
+      {item: item1, geom: g1, rows: g1.dh},
+      {item: item2, geom: g2, rows: g2.dh},
+    ], totalRows: g1.dh + 24 + 24 + g2.dh, breakRows: 24};
+    const sim = new SimTransport({...BIGCAP, feedRows: 100});
+    const r = await T.streamRaster(T.queueRowStream(prepared), prepared.totalRows, {transport: sim, ...FAST, maxRows: 255});
+    ok(r.sentRows === prepared.totalRows, 'cap-split queue sentRows == total');
+    ok(sim.segments.map(s => s.rows).join(',') === '255,33,192', 'cap-split queue blocks [255,33,192] (got ' + sim.segments.map(s => s.rows).join(',') + ')');
+    ok(sim.feeds.some(f => f.at === 255), 'cap-split feed lands inside the 288-row image at 255 (documented tradeoff)');
+    const feedSet = new Set();
+    for (const f of sim.feeds) for (let y = f.at; y < f.at + f.rows; y++) feedSet.add(y);
+    const data = [];
+    for (let y = 0; y < sim.raster.length / 48; y++)
+      if (!feedSet.has(y)) for (let x = 0; x < 48; x++) data.push(sim.raster[y * 48 + x]);
+    ok(data.length === 48 * prepared.totalRows, 'cap-split data minus feeds == total rows');
+    ok(!sim.discarded && sim.footReceived, 'cap-split queue parses clean with foot, no discard');
+  }
+  // 8. Queue kind detection
   {
     ok(T.queueKindFor({name: 'doc.pdf', type: 'application/pdf'}) === 'pdf', 'kind: pdf by name/type');
     ok(T.queueKindFor({name: 'photo.png', type: 'image/png'}) === 'image', 'kind: image');

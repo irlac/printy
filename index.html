@@ -236,10 +236,10 @@ details.how summary{cursor:pointer;color:var(--ink)}
     <div class="row">
       <label>density <select id="density"><option value="8">8</option><option value="10" selected>10</option><option value="12">12</option><option value="15">15</option></select></label>
       <label>write <select id="writeMode"><option value="auto" selected>auto</option><option value="noresp">no-resp only</option><option value="resp">with-resp only</option></select></label>
-      <label>split <select id="splitRows"><option value="never" selected>never</option><option value="255">255 rows</option><option value="128">128 rows</option><option value="64">64 rows</option></select></label>
+      <label>split <select id="splitCap"><option value="255" selected>255 rows</option><option value="128">128 rows</option><option value="64">64 rows</option><option value="never">never</option></select></label>
     </div>
     <p class="hint">Settings save automatically. If chunks send but nothing prints, try “with-resp only” + 20 B chunks.</p>
-    <p class="hint">Package mode: each image prints as one print command, because the M110 feeds ~half an inch after every print command — cutting an image across commands shreds it with gaps. "Split" only cuts images taller than the chosen size, as a fallback for very tall images that might otherwise print blank; split images may show gaps.</p>
+    <p class="hint">Package mode: each image prints as one print command, because the M110 feeds ~half an inch after every print command — cutting an image across commands can shred it with gaps. "Split" cuts images taller than the chosen size (default 255 rows) into back-to-back blocks with no delay between them, so tall images print instead of blanking. "Never" prints any size as one block — tall blocks may print blank; use it only to test your printer's limit.</p>
   </div>
   <div class="card">
     <h2>🕘 Recent prints</h2>
@@ -334,11 +334,11 @@ function switchTab(id){
 function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}
 
 /* ---------------- settings (persisted) ---------------- */
-const settings=Object.assign({chunkSize:'64',chunkDelay:'40',density:'10',mediaType:'11',writeMode:'auto',splitRows:'never'},
+const settings=Object.assign({chunkSize:'64',chunkDelay:'40',density:'10',mediaType:'11',writeMode:'auto',splitCap:'255'},
   JSON.parse(localStorage.getItem('ts_settings')||'{}'));
 function applySettings(){for(const k of Object.keys(settings)){const el=$(k);if(el)el.value=settings[k];}}
 function saveSettings(){for(const k of Object.keys(settings)){const el=$(k);if(el)settings[k]=el.value;}localStorage.setItem('ts_settings',JSON.stringify(settings));}
-['chunkSize','chunkDelay','density','mediaType','writeMode','splitRows'].forEach(id=>{
+['chunkSize','chunkDelay','density','mediaType','writeMode','splitCap'].forEach(id=>{
   document.addEventListener('change',e=>{if(e.target&&e.target.id===id)saveSettings();});
 });
 
@@ -499,9 +499,16 @@ async function writeHead(transport,cfg,ctl){
   await transport.write(head.slice(4,8));await sleep(30);
   await transport.write(head.slice(8,11));await sleep(30);
 }
-async function sendSegment(transport,segBytes,rows,cfg,ctl){
+/* One raster block: header, a short settle, then the data in paced
+   chunks. headerGap is 30 ms for the job's first block (it follows the
+   init commands, matching the reference pacing) and 0 for every later
+   block: if the post-block feed is triggered by the printer idling at
+   a block boundary, starting the next block immediately is what keeps
+   a split image whole. Chunk pacing is untouched, so the stream still
+   carries delays everywhere — this is not a merged no-delay stream. */
+async function sendSegment(transport,segBytes,rows,cfg,ctl,headerGap){
   await transport.write(rasterSegmentHeader(rows));
-  await sleep(30);
+  if(headerGap)await sleep(headerGap);
   await writeChunked(transport,segBytes,cfg.chunkBytes,cfg.gapMs,ctl);
 }
 /* Package boundary marker yielded by row streams: everything since the
@@ -510,16 +517,22 @@ async function sendSegment(transport,segBytes,rows,cfg,ctl){
    so a block boundary inside an image shreds it with a gap; boundaries
    belong only between images. Plain blank rows yielded after a marker
    belong to the NEXT package, so the post-block feed lands in the
-   break, never inside image data. */
+   break, never inside image data. Exception: a package taller than
+   the Split threshold is cut into back-to-back blocks (no header
+   delay between continuation blocks) — it may still feed, but it
+   prints instead of blanking, which is what an oversize single block
+   does (observed 2026-10-24: oversize block blank, job continued). */
 const PKG_END=Object.freeze({pkgEnd:true});
-/* Split threshold from the Printer tab: 'never' (default) means a
-   package is never cut; a number means packages taller than that are
-   cut into blocks of that size (fallback for very tall images that
-   might otherwise print blank — cut images may show gaps). */
+/* Split threshold from the Printer tab (new key: the old splitRows key
+   and its 'never' default are orphaned, so nobody silently keeps the
+   blank-causing default). Default 255: packages taller than that are
+   cut into back-to-back blocks. 'never' means one block of any size
+   (tall blocks may print blank) and exists only to test the printer's
+   real limit. */
 function splitMaxRows(){
-  const v=$('splitRows')&&$('splitRows').value;
-  if(!v||v==='never')return Infinity;
-  return +v||Infinity;
+  const v=$('splitCap')&&$('splitCap').value;
+  if(v==='never')return Infinity;
+  return +v||255;
 }
 /* Core package sender. blocks = async iterable of Uint8Array row data
    (each a multiple of 48 bytes) plus PKG_END markers. Returns
@@ -548,10 +561,14 @@ async function streamRaster(blocks,totalRows,opts={}){
   try{
     await writeHead(transport,cfg,ctl);
     let pending=new Uint8Array(0);
+    let firstBlock=true; // persists across packages within one job
     /* Flush the pending package in blocks of at most maxRows rows.
-       With maxRows Infinity (the default) a package goes out as ONE
-       raster block, so the printer's post-block feed lands between
-       packages, never inside an image. */
+       With maxRows Infinity a package goes out as ONE raster block,
+       so the printer's post-block feed lands between packages, never
+       inside an image. Callers pass the Split threshold (default
+       255), so a taller package is cut into back-to-back blocks:
+       only the job's first block gets the 30 ms header settle, the
+       rest start immediately, to starve the feed of idle time. */
     const flushPackage=async()=>{
       while(pending.length>0){
         const n=Math.min(cfg.maxRows,pending.length/48);
@@ -559,7 +576,8 @@ async function streamRaster(blocks,totalRows,opts={}){
         pending=pending.slice(n*48);
         await waitWhilePaused(ctl);
         if(ctl.cancelled)throw new CancelledError();
-        await sendSegment(transport,seg,n,cfg,ctl);
+        await sendSegment(transport,seg,n,cfg,ctl,firstBlock?30:0);
+        firstBlock=false;
         sentRows+=n;segments++;
         setEngineState('printing',{sentRows,segments});
         if(opts.onProgress)opts.onProgress(sentRows,totalRows);
@@ -2085,6 +2103,10 @@ function queueRenderList(){
     const b=document.createElement('b');b.textContent=item.name;
     const sm=document.createElement('small');
     sm.textContent=(item.kind==='pdf'?'📄 PDF':'🖼️ image')+(item.error?' · ❌ '+item.error:'');
+    if(queuePrepared&&queuePrepared.items[idx]){
+      const pi=queuePrepared.items[idx];
+      sm.textContent+=' · '+pi.rows+' rows'+(item.kind==='pdf'?' ('+pi.geoms.map(g=>g.dh).join('+')+' per page)':'');
+    }
     t.appendChild(b);t.appendChild(sm);d.appendChild(t);
     const ctrls=document.createElement('div');ctrls.className='row';
     const mkNum=(val,min,max,step,fn)=>{

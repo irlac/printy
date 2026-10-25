@@ -275,11 +275,12 @@ async function* blocksOf(bmp, blockRows) {
     await T.printJob(makeBmp(50, 'black'), 50, {transport: sim2, ...FAST});
     ok(sim2.headReceived && sim2.footReceived && sim2.rowsReceived === 50, 'second job after first completes cleanly');
   }
-  // 12. Package mode: a 1000-row single image goes out as ONE block, byte-exact.
+  // 12. Package mode, splitting disabled (Split=never): a 1000-row
+  //     single image goes out as ONE block, byte-exact.
   {
     const bmp = makeBmp(1000, 'random');
     const sim = new SimTransport(BIGCAP);
-    const r = await T.printJob(bmp, 1000, {transport: sim, ...FAST});
+    const r = await T.printJob(bmp, 1000, {transport: sim, ...FAST, maxRows: Infinity});
     ok(sim.segments.map(s => s.rows).join(',') === '1000', 'tall image = 1 package block (got ' + sim.segments.map(s => s.rows).join(',') + ')');
     ok(r.segments === 1 && eq(sim.raster, bmp), 'tall package reconstructs byte-exact');
   }
@@ -355,14 +356,41 @@ async function* blocksOf(bmp, blockRows) {
     }
     ok(allNonBlank, 'every block contains image data (no blank-only block)');
   }
-  // 17. Tall-package risk, documented: IF the M02 255-line cap applies to
-  //     the M110, a 1000-row package blanks. That cap is unproven for the
-  //     M110; split mode is the fallback if hardware ever shows it.
+  // 17. Tall-package risk, documented: with splitting DISABLED
+  //     (Split=never experiment), a 1000-row package under a 255 cap
+  //     is discarded (blank). This is what the hardware showed
+  //     2026-10-24 — and why splitting is now the default.
   {
     const bmp = makeBmp(1000, 'random');
     const sim = new SimTransport({maxSegmentRows: 255});
-    await T.printJob(bmp, 1000, {transport: sim, ...FAST});
+    await T.printJob(bmp, 1000, {transport: sim, ...FAST, maxRows: Infinity});
     ok(sim.discarded && sim.rowsReceived === 0, 'tall package under a 255 cap is discarded (known tradeoff)');
+  }
+  // 18. Incident mirror (2026-10-24): oversize first package blanks,
+  //     the job CONTINUES, later packages print. Per-block discard,
+  //     not whole-job discard.
+  {
+    const big = makeBmp(1000, 'stripe'), small = makeBmp(100, 'black');
+    const sim = new SimTransport({maxSegmentRows: 255});
+    async function* src() { yield big; yield T.PKG_END; yield small; yield T.PKG_END; }
+    const r = await T.streamRaster(src(), 1100, {transport: sim, ...FAST, maxRows: Infinity});
+    ok(sim.discarded, 'oversize package marked discarded');
+    ok(sim.segments.length === 2 && sim.segments[0].blank === true && sim.segments[1].rows === 100,
+      'segments: [blank 1000, 100] (got ' + JSON.stringify(sim.segments) + ')');
+    ok(eq(sim.raster, small), 'later package prints byte-exact after a blanked one');
+    ok(sim.footReceived && r.sentRows === 1100, 'foot received, job completes after blank block');
+  }
+  // 19. The fix for the incident: with the default Split threshold
+  //     (255), the same 1000-row package is cut into back-to-back
+  //     blocks and prints in full under the same cap — no discard.
+  {
+    const bmp = makeBmp(1000, 'random');
+    const sim = new SimTransport({maxSegmentRows: 255});
+    const r = await T.printJob(bmp, 1000, {transport: sim, ...FAST, maxRows: 255});
+    ok(!sim.discarded, 'cap-split package not discarded');
+    ok(sim.segments.map(s => s.rows).join(',') === '255,255,255,235',
+      'cap-split blocks [255,255,255,235] (got ' + sim.segments.map(s => s.rows).join(',') + ')');
+    ok(eq(sim.raster, bmp) && r.sentRows === 1000, 'cap-split raster byte-exact, all rows sent');
   }
 
   console.log(fails === 0 ? '\nALL ENGINE TESTS PASSED' : '\n' + fails + ' FAILURES');

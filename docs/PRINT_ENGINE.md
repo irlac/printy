@@ -375,6 +375,80 @@ and records each feed's row offset, so tests prove where feeds land:
 5. **Split fallback (only if test 1 blanks):** repeat test 1 with
    Split at 255, then 128, and note which size prints whole.
 
+## 6. Cap-split — the incident that proved the cap (2026-10-24)
+
+### What happened
+
+A 3-package queue printed 2 of 3: the first package, suspected
+larger than the others, came out blank, and the job *continued* —
+packages 2 and 3 printed fine. Two corrections follow:
+
+1. **The cap is real for the M110, at least for large blocks.** A
+   block above some size blanks. The exact threshold is still
+   unknown (the blank package's size was not recorded), but the
+   documented family cap of 255 rows is the best prior.
+2. **Discard is per-block, not per-job.** §5's simulator (and the
+   2.0 doc) modelled an oversize block as killing the whole job.
+   Hardware shows the firmware skips that block and keeps going.
+   The simulator now models per-block discard: the oversize block
+   contributes no rows and no feed, parsing continues.
+
+### The fix
+
+- **Cap-split by default.** Packages taller than the Split size
+  (default 255 rows) are cut into back-to-back blocks of that size.
+  Small packages are untouched — still one block, no feed issue.
+  Tall packages now print instead of blanking. The price, stated
+  openly: if the feed is truly per-block-end, a split image gets
+  feeds inside it (one per 255 rows). That is still strictly better
+  than blank, and far less shredded than 2.0's 128-row cuts.
+- **Zero-gap continuation blocks.** Only the job's first block gets
+  the 30 ms header settle; every later block starts immediately
+  after the previous block's last byte. If the feed is triggered by
+  the printer idling at a block boundary (rather than by the block
+  end itself), this starves it of idle time and split images print
+  whole. Chunk pacing (40 ms) and init gaps are untouched, so the
+  stream still carries delays — this is not a merged no-delay
+  stream, and the discard evidence does not apply to it. Zero-gap
+  is a *timing* property, so no byte-level test can prove it; it is
+  verified by code inspection and by the hardware test below.
+- **The default changed, and the key changed with it.** Package
+  mode shipped with Split defaulting to `never` — the exact setting
+  that let a tall package blank. The setting is now `splitCap`
+  (the old `splitRows` key and its `never` value are orphaned, so
+  nobody silently keeps the dangerous default), default `255`,
+  options 255 / 128 / 64 / never. `never` remains, last in the
+  list, for one purpose only: threshold experiments (below).
+- **Per-package row counts.** After Prepare, the queue list shows
+  each item's rows (and per-page rows for PDFs), so the next
+  incident report carries exact sizes instead of suspicions.
+
+### Cap-split test results (simulated, all pass)
+
+| Case | Result |
+|---|---|
+| Incident mirror: oversize package + normal package, capped sim | Oversize marked discarded, segments [blank 1000, 100], later package byte-exact, foot received, job completes. |
+| Fix: 1000-row package, Split=255, capped sim | Blocks [255,255,255,235], no discard, raster byte-exact. |
+| Queue reality: 288-row image, Split=255 | Blocks [255,33,192]; a feed lands inside the image at row 255 (documented tradeoff); data minus feeds exact. |
+| Splitting disabled (Split=never), capped sim | Tall package discarded — the incident, reproduced as the control. |
+| Engine + queue suites, original app suite | All pass (69/69 app checks). |
+
+### Hardware tests still needed (updated)
+
+1. **Cap-split tall image (decisive for the feed question):**
+   print a tall image with Split=255. If it comes out whole with
+   no gaps inside, zero-gap worked and the problem is solved at
+   every size. If it has one gap per 255 rows, the feed is
+   per-block-end and tall images will always carry those gaps —
+   the remaining lever is then the true threshold (below).
+2. **Threshold discovery:** with Split=never, print single images
+   of known sizes (the queue list now shows rows) — e.g. 200, 300,
+   400 rows — and note the smallest size that blanks. That number
+   becomes the Split default, so no image splits unnecessarily.
+3. **Break size** and **pause during a large package** from §5
+   still stand.
+
+
 ### A note on the one test bug found
 
 While validating, the queue trim test initially failed — not in app
