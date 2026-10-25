@@ -236,8 +236,10 @@ details.how summary{cursor:pointer;color:var(--ink)}
     <div class="row">
       <label>density <select id="density"><option value="8">8</option><option value="10" selected>10</option><option value="12">12</option><option value="15">15</option></select></label>
       <label>write <select id="writeMode"><option value="auto" selected>auto</option><option value="noresp">no-resp only</option><option value="resp">with-resp only</option></select></label>
+      <label>segment <select id="segRows"><option value="64">64 rows</option><option value="128" selected>128 rows</option><option value="255">255 rows</option></select></label>
     </div>
     <p class="hint">Settings save automatically. If chunks send but nothing prints, try “with-resp only” + 20 B chunks.</p>
+    <p class="hint">Engine 2.0: long jobs are split into segments (one print command each, default 128 rows) so tall documents can't blank out. A segment is not a BLE chunk and not a job — segments share one init and one footer, so the strip stays continuous.</p>
   </div>
   <div class="card">
     <h2>🕘 Recent prints</h2>
@@ -254,11 +256,42 @@ details.how summary{cursor:pointer;color:var(--ink)}
   </div>
 </section>
 
+<!-- ============ PRINT QUEUE ============ -->
+<section id="tab-queue" class="tab">
+  <div class="card">
+    <h2>🧾 Print queue</h2>
+    <p class="hint">Stack images and PDFs into one continuous strip. The whole queue prints as a single job — one init, one footer, no gaps — through the segmented engine.</p>
+    <div id="queueDrop" class="paper" style="border:2px dashed #999;padding:18px;text-align:center;cursor:pointer">
+      <p style="margin:0">📂 Drop files here, or <label class="btn" style="cursor:pointer">choose files<input type="file" id="queueFile" accept="image/*,.pdf,.bmp" multiple style="display:none"></label></p>
+      <p class="hint" style="margin:6px 0 0">PNG · JPEG · WebP · GIF (first frame) · BMP · multi-page PDF</p>
+    </div>
+    <div id="queueList" style="margin-top:12px"></div>
+    <div class="row" style="margin-top:12px">
+      <button class="primary" id="queuePrepareBtn" onclick="queuePrepare()">🔍 Prepare queue</button>
+      <button class="primary" id="queueStartBtn" onclick="queueStart()" disabled>🖨️ Start printing</button>
+      <button id="queuePauseBtn" onclick="queuePause()" disabled>⏸️ Pause</button>
+      <button id="queueResumeBtn" onclick="queueResume()" disabled>▶️ Resume</button>
+      <button class="danger" id="queueCancelBtn" onclick="queueCancel()" disabled>🚫 Cancel</button>
+      <button class="ghost" onclick="queueClear()">🧹 Clear</button>
+    </div>
+    <p class="hint" id="queueSummary">queue is empty</p>
+    <p class="hint" id="jobStateLine">idle</p>
+    <div style="background:#ddd;height:10px;border-radius:5px;overflow:hidden;margin:8px 0">
+      <div id="queueBar" style="background:#222;height:100%;width:0%"></div>
+    </div>
+    <div style="max-height:420px;overflow:auto;border:1px solid #ccc;background:#fff">
+      <canvas id="queuePrev" width="192" height="120" style="display:block;margin:0 auto"></canvas>
+    </div>
+    <p class="hint">Preview is a half-scale strip of the assembled queue (truncated at 4000px). Spacing rows go between documents, not after the last one. PDFs need network once to load the PDF engine — everything else works offline.</p>
+  </div>
+</section>
+
 </main>
 <nav id="tabbar">
   <button data-tab="tab-studio" class="on" onclick="switchTab('tab-studio')"><span class="ti">🎨</span>Studio</button>
   <button data-tab="tab-labels" onclick="switchTab('tab-labels')"><span class="ti">🏷️</span>Labels</button>
   <button data-tab="tab-image" onclick="switchTab('tab-image')"><span class="ti">🖼️</span>Image</button>
+  <button data-tab="tab-queue" onclick="switchTab('tab-queue')"><span class="ti">🧾</span>Queue</button>
   <button data-tab="tab-chaos" onclick="switchTab('tab-chaos')"><span class="ti">🌙</span>Chaos</button>
   <button data-tab="tab-printer" onclick="switchTab('tab-printer')"><span class="ti">🖨️</span>Printer</button>
 </nav>
@@ -298,11 +331,11 @@ function switchTab(id){
 function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}
 
 /* ---------------- settings (persisted) ---------------- */
-const settings=Object.assign({chunkSize:'64',chunkDelay:'40',density:'10',mediaType:'11',writeMode:'auto'},
+const settings=Object.assign({chunkSize:'64',chunkDelay:'40',density:'10',mediaType:'11',writeMode:'auto',segRows:'128'},
   JSON.parse(localStorage.getItem('ts_settings')||'{}'));
 function applySettings(){for(const k of Object.keys(settings)){const el=$(k);if(el)el.value=settings[k];}}
 function saveSettings(){for(const k of Object.keys(settings)){const el=$(k);if(el)settings[k]=el.value;}localStorage.setItem('ts_settings',JSON.stringify(settings));}
-['chunkSize','chunkDelay','density','mediaType','writeMode'].forEach(id=>{
+['chunkSize','chunkDelay','density','mediaType','writeMode','segRows'].forEach(id=>{
   document.addEventListener('change',e=>{if(e.target&&e.target.id===id)saveSettings();});
 });
 
@@ -323,7 +356,7 @@ async function connect(){
   try{
     log('requesting printer… pick the M110 in the list');
     device=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:[SVC]});
-    device.addEventListener('gattserverdisconnected',()=>{setStatus('disconnected','bad');$('btnConnect').disabled=false;$('btnDisconnect').disabled=true;log('⚠️ printer disconnected');});
+    device.addEventListener('gattserverdisconnected',()=>{setStatus('disconnected','bad');$('btnConnect').disabled=false;$('btnDisconnect').disabled=true;if(engineState.state==='printing'||engineState.state==='paused')setEngineState('failed',{error:'printer disconnected during print'});log('⚠️ printer disconnected');});
     const server=await device.gatt.connect();
     await sleep(600);
     const svc=await server.getPrimaryService(SVC);
@@ -371,40 +404,176 @@ async function queryPrinter(){
     else log('got '+lastNotify.length+' reply packet(s) — write path is alive');
   }catch(e){log('❌ query failed: '+errText(e));}
 }
-async function sendBytes(bytes,onProgress){
-  if(!writeChar||!device?.gatt.connected)throw new Error('printer not connected');
-  const chunkSize=+$('chunkSize').value||128;
-  const gapMs=+$('chunkDelay').value||40;
-  const wmode=$('writeMode').value||'auto';
-  const sendPart=async(part,delayAfter)=>{
-    const buf=new Uint8Array(part).buffer;
+/* ================= Print Engine 2.0 =================
+   Three levels, three different limits — do not conflate them:
+   - JOB: one physical printout. Exactly one init block at the start
+     (speed + density + media) and exactly one footer at the end.
+     A job may contain any number of segments.
+   - SEGMENT: one GS v 0 raster command = 8-byte header + up to
+     segmentRows rows (48 bytes each). The printer only has to absorb
+     one segment at a time. This is the fix for blank output on tall
+     documents: the old engine sent the whole document as ONE segment,
+     and no public source verifies the M110 firmware accepts an
+     arbitrarily tall single block (the only documented block cap in
+     this printer family is 255 lines). Default 128 rows, configurable.
+   - CHUNK: one BLE GATT write (<= chunkBytes). Pure transport
+     packetization; the printer never sees chunk boundaries.
+   Write completion is NOT print completion: a resolved GATT write only
+   means the OS accepted the bytes. The engine reports SENT rows, never
+   claims the paper is done before footer + settle delay, and never
+   resends anything without the user pressing print again. */
+class CancelledError extends Error{constructor(){super('cancelled');this.cancelled=true;}}
+const JOB_FOOT=new Uint8Array([0x1f,0xf0,0x05,0x00,0x1f,0xf0,0x03,0x00]);
+function jobHeadBytes(dens,med){
+  return new Uint8Array([0x1b,0x4e,0x0d,0x05, 0x1b,0x4e,0x04,dens, 0x1f,0x11,med]);
+}
+function rasterSegmentHeader(rows){
+  return new Uint8Array([0x1d,0x76,0x30,0x00, 48,0, rows&0xff,(rows>>8)&0xff]);
+}
+/* transport interface: {connected:boolean, write(Uint8Array)->Promise}.
+   The real one wraps the Web Bluetooth characteristic; tests substitute
+   a simulator with the same shape. */
+const bleTransport={
+  get connected(){return !!writeChar&&!!device?.gatt?.connected;},
+  async write(bytes){
+    const wmode=$('writeMode')?$('writeMode').value:'auto';
+    const buf=new Uint8Array(bytes).buffer;
     if(wmode==='resp'){await writeChar.writeValue(buf);}
     else if(wmode==='noresp'){await writeChar.writeValueWithoutResponse(buf);}
     else{try{await writeChar.writeValueWithoutResponse(buf);}
       catch(e){await writeChar.writeValue(buf);}}
-    if(delayAfter)await sleep(delayAfter);
-  };
-  await sendPart(bytes.slice(0,4),30);
-  await sendPart(bytes.slice(4,8),30);
-  await sendPart(bytes.slice(8,11),30);
-  await sendPart(bytes.slice(11,19),30);
-  const rasterEnd=bytes.length-8;
-  const total=Math.ceil((rasterEnd-19)/chunkSize);
-  let done=0;
-  for(let i=19;i<rasterEnd;i+=chunkSize){
-    await sendPart(bytes.slice(i,Math.min(i+chunkSize,rasterEnd)),gapMs);
-    done++;
-    if(onProgress)onProgress(done,total);
   }
-  await sleep(300);
-  await sendPart(bytes.slice(rasterEnd),0);
-  await sleep(500);
+};
+/* ---- job state machine ----
+   idle -> preparing -> ready -> printing -> paused <-> printing
+                                        -> completed / failed / cancelled
+   Direct prints go preparing -> printing (the click IS the confirmation).
+   The queue goes preparing -> ready (preview + summary shown, user
+   presses Start) -> printing. Pause is only honoured between segments,
+   never mid-segment: a printer left waiting mid-raster may time out
+   and discard the block. */
+const engineState={state:'idle',label:'',sentRows:0,totalRows:0,segments:0,totalSegments:0,error:null};
+function setEngineState(s,patch){
+  engineState.state=s;
+  if(patch)Object.assign(engineState,patch);
+  renderEngineStatus();
 }
-async function printJob(bytes,onProgress){
-  if(printing)throw new Error('already printing — wait for the current job');
+function renderEngineStatus(){
+  const el=$('jobStateLine');if(!el)return;
+  const st=engineState;
+  let t='idle';
+  if(st.state==='printing')t=`🖨️ printing — ${st.sentRows}/${st.totalRows} rows · segment ${st.segments}/${st.totalSegments}`;
+  else if(st.state==='paused')t=`⏸️ paused — ${st.sentRows}/${st.totalRows} rows sent (printer is waiting between segments)`;
+  else if(st.state==='preparing')t='⏳ preparing…';
+  else if(st.state==='ready')t=`✅ ready — ${st.totalRows} rows · press Start to print`;
+  else if(st.state==='completed')t=`✅ completed — ${st.sentRows} rows sent (printer may still be feeding)`;
+  else if(st.state==='failed')t=`❌ failed after ${st.sentRows}/${st.totalRows} rows — ${st.error||'unknown error'} · nothing was resent`;
+  else if(st.state==='cancelled')t=`🚫 cancelled after ${st.sentRows}/${st.totalRows} rows — nothing was resent`;
+  el.textContent=t;
+}
+function makeJobCtl(){return {cancelled:false,paused:false};}
+async function waitWhilePaused(ctl){
+  if(!ctl||!ctl.paused)return;
+  setEngineState('paused',{});
+  while(ctl.paused&&!ctl.cancelled)await sleep(100);
+  if(ctl.cancelled)throw new CancelledError();
+  setEngineState('printing',{});
+}
+async function writeChunked(transport,bytes,chunkBytes,gapMs,ctl){
+  for(let i=0;i<bytes.length;i+=chunkBytes){
+    if(ctl&&ctl.cancelled)throw new CancelledError();
+    if(!transport.connected)throw new Error('printer disconnected');
+    await transport.write(bytes.slice(i,i+chunkBytes));
+    if(gapMs&&i+chunkBytes<bytes.length)await sleep(gapMs);
+  }
+}
+async function writeHead(transport,cfg,ctl){
+  const head=jobHeadBytes(cfg.density,cfg.media);
+  await transport.write(head.slice(0,4));await sleep(30);
+  await transport.write(head.slice(4,8));await sleep(30);
+  await transport.write(head.slice(8,11));await sleep(30);
+}
+async function sendSegment(transport,segBytes,rows,cfg,ctl){
+  await transport.write(rasterSegmentHeader(rows));
+  await sleep(30);
+  await writeChunked(transport,segBytes,cfg.chunkBytes,cfg.gapMs,ctl);
+}
+/* Core segmented sender. blocks = async iterable of Uint8Array row data
+   (each block a multiple of 48 bytes). Returns {sentRows,segments}.
+   Throws on transport failure; returns {cancelled:true} on cancel. */
+async function streamRaster(blocks,totalRows,opts={}){
+  const transport=opts.transport||bleTransport;
+  const ctl=opts.ctl||makeJobCtl();
+  const cfg={
+    segmentRows:opts.segmentRows||128,
+    chunkBytes:opts.chunkBytes||64,
+    gapMs:opts.gapMs==null?40:opts.gapMs,
+    density:opts.density==null?10:opts.density,
+    media:opts.media==null?0x0b:opts.media,
+  };
+  if(!transport.connected)throw new Error('printer not connected');
+  if(!totalRows||totalRows<=0)throw new Error('nothing to print');
+  if(engineState.state==='printing'||engineState.state==='paused')
+    throw new Error('already printing — wait for the current job');
+  setEngineState('printing',{label:opts.label||'',sentRows:0,totalRows,
+    segments:0,totalSegments:Math.ceil(totalRows/cfg.segmentRows),error:null});
   printing=true;
-  try{await sendBytes(bytes,onProgress);}
-  finally{printing=false;}
+  let sentRows=0,segments=0;
+  try{
+    await writeHead(transport,cfg,ctl);
+    let pending=new Uint8Array(0);
+    const segBytes=cfg.segmentRows*48;
+    const sendOneSegment=async()=>{
+      const n=Math.min(cfg.segmentRows,pending.length/48);
+      if(n<=0)return;
+      const seg=pending.slice(0,n*48);
+      pending=pending.slice(n*48);
+      await waitWhilePaused(ctl);
+      if(ctl.cancelled)throw new CancelledError();
+      await sendSegment(transport,seg,n,cfg,ctl);
+      sentRows+=n;segments++;
+      setEngineState('printing',{sentRows,segments});
+      if(opts.onProgress)opts.onProgress(sentRows,totalRows);
+    };
+    for await(const block of blocks){
+      if(block.length%48!==0)throw new Error('row block is not 48-byte aligned');
+      const nb=new Uint8Array(pending.length+block.length);
+      nb.set(pending);nb.set(block,pending.length);pending=nb;
+      while(pending.length>=segBytes)await sendOneSegment();
+    }
+    while(pending.length>0)await sendOneSegment();
+    if(sentRows!==totalRows)throw new Error('row count mismatch: sent '+sentRows+', expected '+totalRows);
+    /* footer exactly once, at the very end — never between segments */
+    await sleep(300);
+    if(ctl.cancelled)throw new CancelledError();
+    await writeChunked(transport,JOB_FOOT,cfg.chunkBytes,0,ctl);
+    await sleep(500);
+    setEngineState('completed',{sentRows,segments});
+    return {sentRows,segments,cancelled:false};
+  }catch(e){
+    if(e instanceof CancelledError||ctl.cancelled){
+      setEngineState('cancelled',{sentRows,segments});
+      return {sentRows,segments,cancelled:true};
+    }
+    setEngineState('failed',{sentRows,segments,error:errText(e)});
+    throw e;
+  }finally{
+    printing=false;
+  }
+}
+/* Legacy-compatible entry: one in-memory bitmap, sent segmented.
+   All existing print buttons go through here now. opts may carry
+   onProgress, ctl, transport, segmentRows, chunkBytes, gapMs, label. */
+async function printJob(bmp,h,opts={}){
+  const cfg={
+    segmentRows:opts.segmentRows||+($('segRows')&&$('segRows').value||128),
+    chunkBytes:opts.chunkBytes||+($('chunkSize')&&$('chunkSize').value||64),
+    gapMs:opts.gapMs==null?(+($('chunkDelay')&&$('chunkDelay').value||40)):opts.gapMs,
+    density:opts.density||+($('density')&&$('density').value||10),
+    media:opts.media==null?(+($('mediaType')&&$('mediaType').value||0x0b)):opts.media,
+  };
+  async function* oneBlock(){yield bmp;}
+  return streamRaster(oneBlock(),h,Object.assign({},opts,cfg));
 }
 function buildJob(bmp,h,media){
   const dens=+$('density').value||10;
@@ -427,7 +596,7 @@ async function printTestPattern(){
   $('sendProg').textContent='sending…';
   try{
     const {bmp,h}=testPattern();
-    await printJob(buildJob(bmp,h),(d,t)=>{$('sendProg').textContent=`chunk ${d}/${t}`;});
+    await printJob(bmp,h,{onProgress:(d,t)=>{$('sendProg').textContent=`${d}/${t} rows`;}});
     $('sendProg').textContent='done — did anything come out?';
     log('🧪 test pattern sent'); rememberPrint('test pattern',bmp,h);
   }catch(e){$('sendProg').textContent='failed';log('❌ '+errText(e));}
@@ -769,7 +938,7 @@ async function printDesign(){
   try{
     const {bmp,h}=await composeDesign();
     $('printProg').textContent='sending…';
-    await printJob(buildJob(bmp,h),(d,t)=>{$('printProg').textContent=`chunk ${d}/${t}`;});
+    await printJob(bmp,h,{onProgress:(d,t)=>{$('printProg').textContent=`${d}/${t} rows`;}});
     $('printProg').textContent='done ✅';
     log(`🖨️ printed design “${design.name}” (${h}px)`);
     rememberPrint('design: '+design.name,bmp,h);
@@ -1135,7 +1304,7 @@ async function labPrint(){
   const r=labProcess();if(!r){toast('no image yet');return;}
   $('labProg').textContent='sending…';
   try{
-    await printJob(buildJob(r.bmp,r.h),(d,t)=>{$('labProg').textContent=`chunk ${d}/${t}`;});
+    await printJob(r.bmp,r.h,{onProgress:(d,t)=>{$('labProg').textContent=`${d}/${t} rows`;}});
     $('labProg').textContent='done ✅';log(`🖨️ printed photo (${r.h}px)`);
     rememberPrint('photo ('+labState.dither+')',r.bmp,r.h);
     setTimeout(()=>{$('labProg').textContent='';},4000);
@@ -1284,7 +1453,7 @@ async function danbooruPrintNow(){
   $('dbProg').textContent='hunting…';
   try{
     const {post,bmp,h}=await danbooruPiece(tag,cfg.rating);
-    await printJob(buildJob(bmp,h),(d,t)=>{$('dbProg').textContent=`chunk ${d}/${t}`;});
+    await printJob(bmp,h,{onProgress:(d,t)=>{$('dbProg').textContent=`${d}/${t} rows`;}});
     $('dbProg').textContent='done ✅';
     log(`🔞 printed danbooru #${post.id} (${name})`);
     rememberPrint('danbooru: '+name,bmp,h);
@@ -1740,7 +1909,7 @@ async function broadcastOnce(){
   $('onair').textContent='tuning to '+type+'…';
   try{
     const piece=await produce(type);
-    await printJob(buildJob(piece.bmp,piece.h));
+    await printJob(piece.bmp,piece.h);
     Director.note(type,piece.label,piece.visual);
     $('onair').textContent='now playing: '+piece.label;
     log(`📡 <b>${type}</b> → ${piece.label}`);
@@ -1778,7 +1947,7 @@ async function fire(){
   const type=Director.pick(chaosCount,maxP,hour);
   try{
     const piece=await produce(type);
-    await printJob(buildJob(piece.bmp,piece.h));
+    await printJob(piece.bmp,piece.h);
     chaosCount++;
     Director.note(type,piece.label,piece.visual);
     log(`⚡ #${chaosCount} <b>[${type}]</b> ${piece.label}`);
@@ -1833,7 +2002,7 @@ async function reprint(i){
   const p=r[i];if(!p)return;
   if(!writeChar){toast('connect the printer first');log('❌ connect the printer first');return;}
   try{
-    await printJob(buildJob(b64dec(p.b64),p.h));
+    await printJob(b64dec(p.b64),p.h);
     log('🖨️ reprinted: '+p.label);toast('reprinted ✅');
   }catch(e){log('❌ reprint failed: '+errText(e));}
 }
@@ -1842,6 +2011,442 @@ function labToggleInvert(){
   $('labInvertBtn').textContent='🔄 Invert: '+(labState.invert?'on':'off');
   labRender();
 }
+/* ================= PRINT QUEUE (Engine 2.0) =================
+   A queue is a list of files rendered to ONE continuous 384-wide
+   raster strip and printed as ONE job (one init, one footer).
+   Memory is bounded: items render one at a time, in 256-row bands,
+   and rows stream to the engine — the whole queue is never held as
+   one bitmap. Prepare and print share the same per-item geometry, so
+   the row count promised at Prepare is exactly the row count printed. */
+const QBAND=256;
+let queueItems=[];
+let queueCtl=null;
+let queuePrepared=null;
+let queueLastAttempt=null;
+let queueIdSeq=1;
+function queueKindFor(file){
+  if(/\.pdf$/i.test(file.name)||file.type==='application/pdf')return 'pdf';
+  return 'image';
+}
+function queueDefaultItem(file){
+  return {id:queueIdSeq++,file,name:file.name,kind:queueKindFor(file),
+    scalePct:100,dither:'floyd',bright:0,contrast:0,invert:false,trim:false,
+    spacingRows:24,pages:'',error:null};
+}
+function queueInvalidate(){
+  queuePrepared=null;
+  $('queueStartBtn').disabled=true;
+  $('queueBar').style.width='0%';
+}
+function queueClear(){
+  queueItems=[];queuePrepared=null;queueLastAttempt=null;
+  queueRenderList();
+  $('queueSummary').textContent='queue is empty';
+  $('queueStartBtn').disabled=true;
+  const cv=$('queuePrev');cv.width=192;cv.height=120;
+  const c=cv.getContext('2d');c.fillStyle='#fff';c.fillRect(0,0,192,120);
+}
+function queueRenderList(){
+  const box=$('queueList');box.innerHTML='';
+  if(!queueItems.length){box.innerHTML='<p class="hint">nothing in the queue yet</p>';return;}
+  queueItems.forEach((item,idx)=>{
+    const d=document.createElement('div');d.className='elrow';
+    const t=document.createElement('div');t.className='t';
+    const b=document.createElement('b');b.textContent=item.name;
+    const sm=document.createElement('small');
+    sm.textContent=(item.kind==='pdf'?'📄 PDF':'🖼️ image')+(item.error?' · ❌ '+item.error:'');
+    t.appendChild(b);t.appendChild(sm);d.appendChild(t);
+    const ctrls=document.createElement('div');ctrls.className='row';
+    const mkNum=(val,min,max,step,fn)=>{
+      const inp=document.createElement('input');inp.type='number';inp.value=val;inp.min=min;inp.max=max;inp.step=step;
+      inp.style.width='64px';inp.onchange=()=>{fn(+inp.value);queueInvalidate();queueRenderList();};
+      return inp;
+    };
+    const mkSel=(val,opts,fn)=>{
+      const s=document.createElement('select');
+      for(const o of opts){const op=document.createElement('option');op.value=o;op.textContent=o;s.appendChild(op);}
+      s.value=val;s.onchange=()=>{fn(s.value);queueInvalidate();queueRenderList();};
+      return s;
+    };
+    const lab=(txt,el)=>{const l=document.createElement('label');l.style.fontSize='12px';l.textContent=txt+' ';l.appendChild(el);return l;};
+    ctrls.appendChild(lab('scale %',mkNum(item.scalePct,25,100,5,v=>{item.scalePct=v;})));
+    ctrls.appendChild(lab('dither',mkSel(item.dither,['floyd','atkinson','bayer','threshold'],v=>{item.dither=v;})));
+    ctrls.appendChild(lab('gap rows',mkNum(item.spacingRows,0,400,1,v=>{item.spacingRows=v;})));
+    const trim=document.createElement('input');trim.type='checkbox';trim.checked=item.trim;
+    trim.onchange=()=>{item.trim=trim.checked;queueInvalidate();queueRenderList();};
+    ctrls.appendChild(lab('trim white',trim));
+    if(item.kind==='pdf'){
+      const pg=document.createElement('input');pg.type='text';pg.value=item.pages;pg.placeholder='all';
+      pg.style.width='70px';
+      pg.onchange=()=>{item.pages=pg.value;queueInvalidate();queueRenderList();};
+      ctrls.appendChild(lab('pages',pg));
+    }
+    const up=document.createElement('button');up.textContent='↑';
+    up.disabled=idx===0;
+    up.onclick=()=>{queueItems.splice(idx,1);queueItems.splice(idx-1,0,item);queueInvalidate();queueRenderList();};
+    const dn=document.createElement('button');dn.textContent='↓';
+    dn.disabled=idx===queueItems.length-1;
+    dn.onclick=()=>{queueItems.splice(idx,1);queueItems.splice(idx+1,0,item);queueInvalidate();queueRenderList();};
+    const rm=document.createElement('button');rm.textContent='✕';
+    rm.onclick=()=>{queueItems.splice(idx,1);queueInvalidate();queueRenderList();};
+    ctrls.appendChild(up);ctrls.appendChild(dn);ctrls.appendChild(rm);
+    d.appendChild(ctrls);
+    box.appendChild(d);
+  });
+  if(!queuePrepared)$('queueSummary').textContent=queueItems.length+' item(s) — press Prepare to measure and preview';
+}
+function queueAddFiles(list){
+  for(const f of list)queueItems.push(queueDefaultItem(f));
+  queueInvalidate();queueRenderList();
+  toast(queueItems.length+' item(s) in queue');
+}
+function parsePages(sel,count){
+  sel=(sel||'').trim();
+  if(!sel||sel.toLowerCase()==='all')return [...Array(count).keys()];
+  const out=new Set();
+  for(const part of sel.split(',')){
+    const p=part.trim();
+    const mm=p.match(/^(\d+)\s*-\s*(\d+)$/);
+    if(mm){for(let i=+mm[1];i<=+mm[2];i++)if(i>=1&&i<=count)out.add(i-1);}
+    else if(/^\d+$/.test(p)){const i=+p;if(i>=1&&i<=count)out.add(i-1);}
+    else throw new Error('bad page selection "'+p+'" (use like 1,3 or 2-4)');
+  }
+  const arr=[...out].sort((a,b)=>a-b);
+  if(!arr.length)throw new Error('page selection matched no pages');
+  return arr;
+}
+async function queueLoadImage(file){
+  // ImageDecoder gives the true first frame (GIF); <img> is the fallback.
+  try{
+    if(window.ImageDecoder){
+      const buf=await file.arrayBuffer();
+      const dec=new ImageDecoder({data:buf,type:file.type||'image/png'});
+      const {image}=await dec.decode({frameIndex:0});
+      return {src:image,w:image.displayWidth,h:image.displayHeight,close:()=>{try{image.close();}catch(e){}}};
+    }
+  }catch(e){/* fall through to <img> */}
+  const url=URL.createObjectURL(file);
+  const im=await new Promise((res,rej)=>{
+    const i=new Image();
+    i.onload=()=>res(i);i.onerror=()=>rej(new Error('could not decode '+file.name));
+    i.src=url;
+  });
+  return {src:im,w:im.naturalWidth,h:im.naturalHeight,close:()=>URL.revokeObjectURL(url)};
+}
+let pdfLibPromise=null;
+function loadPdfLib(){
+  if(pdfLibPromise)return pdfLibPromise;
+  pdfLibPromise=new Promise((res,rej)=>{
+    if(window.pdfjsLib)return res(window.pdfjsLib);
+    const s=document.createElement('script');
+    s.src='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+    s.onload=()=>{
+      try{
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc=
+          'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        res(window.pdfjsLib);
+      }catch(e){rej(e);}
+    };
+    s.onerror=()=>rej(new Error('PDF engine failed to load (network?)'));
+    document.head.appendChild(s);
+  });
+  return pdfLibPromise;
+}
+async function loadPdfDoc(item){
+  const lib=await loadPdfLib();
+  if(!item._pdfBytes)item._pdfBytes=await item.file.arrayBuffer();
+  // slice: pdf.js may transfer (neuter) the buffer to its worker
+  return lib.getDocument({data:item._pdfBytes.slice()}).promise;
+}
+/* banded trim scan: find the non-white bbox in source coords, or null */
+async function scanSourceBbox(src,sw,sh){
+  const scanW=Math.min(sw,192),scale=scanW/sw;
+  let x0=Infinity,y0=Infinity,x1=-1,y1=-1;
+  for(let by=0;by<sh;by+=256){
+    const bh=Math.min(256,sh-by);
+    const cv=newCanvas(scanW,Math.max(1,Math.round(bh*scale)));
+    const c=cv.getContext('2d',{willReadFrequently:true});
+    c.fillStyle='#fff';c.fillRect(0,0,cv.width,cv.height);
+    c.drawImage(src,0,by,sw,bh,0,0,cv.width,cv.height);
+    const d=c.getImageData(0,0,cv.width,cv.height).data;
+    for(let y=0;y<cv.height;y++)for(let x=0;x<cv.width;x++){
+      const i=(y*cv.width+x)*4;
+      if((d[i]+d[i+1]+d[i+2])/3<250){
+        if(x<x0)x0=x;if(x>x1)x1=x;
+        const sy=by+Math.floor(y/scale);
+        if(sy<y0)y0=sy;if(sy>y1)y1=sy;
+      }
+    }
+  }
+  if(x1<0)return null;
+  const pad=2;
+  const bx0=Math.max(0,Math.floor(x0/scale)-pad),by0=Math.max(0,y0-pad);
+  const bx1=Math.min(sw,Math.ceil((x1+1)/scale)+pad),by1=Math.min(sh,y1+1+pad);
+  return {x0:bx0,y0:by0,w:bx1-bx0,h:by1-by0};
+}
+/* shared geometry: prepare and print compute the same dh, so row counts match */
+function queueGeom(sw,sh,trimBbox,scalePct){
+  let sx=0,sy=0,sW=sw,sH=sh;
+  if(trimBbox){sx=trimBbox.x0;sy=trimBbox.y0;sW=trimBbox.w;sH=trimBbox.h;}
+  const dw=Math.max(1,Math.round(384*scalePct/100));
+  const dh=Math.max(1,Math.round(sH*dw/sW));
+  return {sx,sy,sW,sH,dw,dh};
+}
+function packBitsFromBin(bin,w,h){
+  const bw=Math.ceil(w/8),bmp=new Uint8Array(bw*h);
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++)
+    if(bin[y*w+x])bmp[y*bw+(x>>3)]|=0x80>>(x&7);
+  return bmp;
+}
+/* error-diffusion dither that carries error across band boundaries, so a
+   256-row band seam is invisible (plain per-band dithering would reset
+   the error every band and draw a faint line). Threshold/bayer are
+   per-pixel and need no carry. */
+function makeBandDither(mode,w){
+  if(mode==='threshold'||mode==='bayer')
+    return (gray,h)=>dither(gray,w,h,mode);
+  const isAtk=mode==='atkinson';
+  const spread=isAtk
+    ? [[1,0,1/8],[2,0,1/8],[-1,1,1/8],[0,1,1/8],[1,1,1/8],[0,2,1/8]]
+    : [[1,0,7/16],[-1,1,3/16],[0,1,5/16],[1,1,1/16]];
+  let errRows=[new Float32Array(w),new Float32Array(w)];
+  return (gray,h)=>{
+    const g=Float32Array.from(gray);
+    for(let x=0;x<w;x++)g[x]+=errRows[0][x];
+    if(h>1)for(let x=0;x<w;x++)g[w+x]+=errRows[1][x];
+    const out=new Uint8Array(w*h);
+    const nxt=[new Float32Array(w),new Float32Array(w)];
+    for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+      const i=y*w+x,old=g[i],nv=old<128?0:255;
+      out[i]=nv===0?1:0;
+      const err=old-nv;
+      for(const [dx,dy,f] of spread){
+        const xx=x+dx,yy=y+dy;
+        if(xx<0||xx>=w)continue;
+        if(yy<h)g[yy*w+xx]+=err*f;
+        else if(yy===h)nxt[0][xx]+=err*f;
+        else if(yy===h+1)nxt[1][xx]+=err*f;
+      }
+    }
+    if(h===1)for(let x=0;x<w;x++)nxt[0][x]+=errRows[1][x];
+    errRows=nxt;
+    return out;
+  };
+}
+/* Render one source (image / page canvas) to 384-wide 1-bit rows, banded.
+   geom comes from Prepare; rows yielded always total exactly geom.dh. */
+async function* renderSourceRows(src,geom,opts){
+  const x0=Math.round((384-geom.dw)/2);
+  const ditherBand=makeBandDither(opts.dither,384);
+  for(let y0=0;y0<geom.dh;y0+=QBAND){
+    const bh=Math.min(QBAND,geom.dh-y0);
+    const cv=newCanvas(384,bh),c=cv.getContext('2d',{willReadFrequently:true});
+    c.fillStyle='#fff';c.fillRect(0,0,384,bh);
+    const ssy=geom.sy+Math.floor(y0*geom.sH/geom.dh);
+    const sye=geom.sy+Math.floor((y0+bh)*geom.sH/geom.dh);
+    const ssh=Math.max(1,sye-ssy);
+    c.drawImage(src,geom.sx,ssy,geom.sW,ssh,x0,0,geom.dw,bh);
+    const gray=canvasToGray(cv);
+    applyLevels(gray,opts.bright,opts.contrast);
+    if(opts.invert)for(let i=0;i<gray.length;i++)gray[i]=255-gray[i];
+    yield packBitsFromBin(ditherBand(gray,bh),384,bh);
+  }
+}
+/* The queue's row stream: items in order, spacing between (not after last) */
+async function* queueRowStream(prepared){
+  for(let i=0;i<prepared.items.length;i++){
+    const pi=prepared.items[i],item=pi.item;
+    if(item.kind==='pdf'){
+      const doc=await loadPdfDoc(item);
+      for(let k=0;k<pi.pages.length;k++){
+        const page=await doc.getPage(pi.pages[k]+1);
+        const v0=page.getViewport({scale:1});
+        const cv=newCanvas(384,Math.round(v0.height*384/v0.width));
+        await page.render({canvasContext:cv.getContext('2d'),viewport:page.getViewport({scale:384/v0.width})}).promise;
+        yield* renderSourceRows(cv,pi.geoms[k],item);
+      }
+    }else{
+      const img=await queueLoadImage(item.file);
+      try{yield* renderSourceRows(img.src,pi.geom,item);}
+      finally{img.close();}
+    }
+    if(i<prepared.items.length-1){
+      const sp=item.spacingRows||0;
+      if(sp>0)yield new Uint8Array(48*sp);
+    }
+  }
+}
+function queueEstimateText(rows){
+  const cb=+($('chunkSize')&&$('chunkSize').value||64),gap=+($('chunkDelay')&&$('chunkDelay').value||40);
+  const rps=(cb/Math.max(gap,1)*1000)/48;
+  const sec=Math.ceil(rows/rps);
+  if(sec<60)return sec+'s';
+  return Math.floor(sec/60)+'m '+(sec%60)+'s';
+}
+async function queuePrepare(){
+  if(!queueItems.length){toast('queue is empty');return;}
+  if(engineState.state==='printing'||engineState.state==='paused'){toast('a job is already running');return;}
+  setEngineState('preparing',{});
+  $('queuePrepareBtn').disabled=true;
+  try{
+    const prepared={items:[],totalRows:0};
+    for(const item of queueItems){
+      item.error=null;
+      const pi={item,pages:[],geoms:[],geom:null,rows:0};
+      try{
+        if(item.kind==='pdf'){
+          const doc=await loadPdfDoc(item);
+          pi.pages=parsePages(item.pages,doc.numPages);
+          for(const pno of pi.pages){
+            const page=await doc.getPage(pno+1);
+            const v0=page.getViewport({scale:1});
+            const g=queueGeom(384,Math.round(v0.height*384/v0.width),null,item.scalePct);
+            pi.geoms.push(g);pi.rows+=g.dh;
+          }
+        }else{
+          const img=await queueLoadImage(item.file);
+          try{
+            let bbox=null;
+            if(item.trim)bbox=await scanSourceBbox(img.src,img.w,img.h);
+            pi.geom=queueGeom(img.w,img.h,bbox,item.scalePct);
+            pi.rows=pi.geom.dh;
+          }finally{img.close();}
+        }
+      }catch(e){
+        item.error=errText(e);
+        throw new Error(item.name+': '+errText(e));
+      }
+      prepared.items.push(pi);
+      prepared.totalRows+=pi.rows;
+    }
+    for(let i=0;i<prepared.items.length-1;i++)
+      prepared.totalRows+=prepared.items[i].item.spacingRows||0;
+    if(prepared.totalRows<=0)throw new Error('queue renders to zero rows');
+    queuePrepared=prepared;
+    await queueRenderPreview(prepared);
+    queueRenderList();
+    $('queueSummary').textContent=
+      prepared.items.length+' document(s) · '+prepared.totalRows+' rows · ~'+
+      queueEstimateText(prepared.totalRows)+' at current pacing';
+    setEngineState('ready',{totalRows:prepared.totalRows,sentRows:0,segments:0,
+      totalSegments:Math.ceil(prepared.totalRows/(+($('segRows')&&$('segRows').value||128)))});
+    $('queueStartBtn').disabled=false;
+    log('🧾 queue ready: '+prepared.totalRows+' rows');
+  }catch(e){
+    setEngineState('idle',{});
+    $('queueSummary').textContent='prepare failed: '+errText(e);
+    queueRenderList();
+    log('❌ queue prepare failed: '+errText(e));
+  }finally{
+    $('queuePrepareBtn').disabled=false;
+  }
+}
+function queuePaintPreview(ctx,cv,y,PW,item){
+  const gray=canvasToGray(cv);
+  applyLevels(gray,item.bright,item.contrast);
+  if(item.invert)for(let i=0;i<gray.length;i++)gray[i]=255-gray[i];
+  const bin=dither(gray,cv.width,cv.height,item.dither);
+  const x0=Math.round((PW-cv.width)/2);
+  const id=ctx.createImageData(PW,cv.height);
+  for(let i=0;i<id.data.length;i+=4){id.data[i]=id.data[i+1]=id.data[i+2]=255;id.data[i+3]=255;}
+  for(let yy=0;yy<cv.height;yy++)for(let xx=0;xx<cv.width;xx++){
+    if(bin[yy*cv.width+xx]){
+      const di=(yy*PW+(x0+xx))*4;
+      id.data[di]=id.data[di+1]=id.data[di+2]=0;
+    }
+  }
+  ctx.putImageData(id,0,y);
+  return cv.height;
+}
+async function queueRenderPreview(prepared){
+  const PW=192;
+  let est=0;
+  for(const pi of prepared.items){
+    if(pi.item.kind==='pdf')for(const g of pi.geoms)est+=Math.max(1,Math.round(g.dh/2))+2;
+    else est+=Math.max(1,Math.round(pi.geom.dh/2))+2;
+  }
+  est+=prepared.items.length*4;
+  const cv=$('queuePrev');
+  cv.width=PW;cv.height=Math.max(120,Math.min(4000,est+20));
+  const ctx=cv.getContext('2d');
+  ctx.fillStyle='#fff';ctx.fillRect(0,0,PW,cv.height);
+  let y=0;
+  for(const pi of prepared.items){
+    if(y>=4000)break;
+    const item=pi.item;
+    if(item.kind==='pdf'){
+      const doc=await loadPdfDoc(item);
+      for(let k=0;k<pi.pages.length;k++){
+        if(y>=4000)break;
+        const page=await doc.getPage(pi.pages[k]+1);
+        const v0=page.getViewport({scale:1});
+        const scale=PW/v0.width*(item.scalePct/100);
+        const vp=page.getViewport({scale});
+        const pc=newCanvas(Math.round(vp.width),Math.round(vp.height));
+        await page.render({canvasContext:pc.getContext('2d'),viewport:vp}).promise;
+        y+=queuePaintPreview(ctx,pc,y,PW,item)+2;
+      }
+    }else{
+      const img=await queueLoadImage(item.file);
+      try{
+        const g=pi.geom;
+        const pw=Math.max(1,Math.round(g.dw/2)),ph=Math.max(1,Math.round(g.dh/2));
+        const pc=newCanvas(pw,ph);
+        const c=pc.getContext('2d');
+        c.fillStyle='#fff';c.fillRect(0,0,pw,ph);
+        c.drawImage(img.src,g.sx,g.sy,g.sW,g.sH,0,0,pw,ph);
+        y+=queuePaintPreview(ctx,pc,y,PW,item)+2;
+      }finally{img.close();}
+    }
+    y+=4; // gap between documents in the preview
+  }
+}
+async function queueStart(){
+  if(!queuePrepared){toast('prepare the queue first');return;}
+  if(!writeChar){toast('connect the printer first');return;}
+  if(engineState.state==='printing'||engineState.state==='paused'){toast('a job is already running');return;}
+  if(queueLastAttempt&&queueLastAttempt.outcome!=='completed'&&queueLastAttempt.sentRows>0){
+    if(!confirm('The last attempt sent '+queueLastAttempt.sentRows+' rows, which may have already printed. Print the whole queue again from the start?'))return;
+  }
+  queueCtl=makeJobCtl();
+  const total=queuePrepared.totalRows;
+  $('queueStartBtn').disabled=true;
+  $('queuePauseBtn').disabled=false;
+  $('queueCancelBtn').disabled=false;
+  $('queueResumeBtn').disabled=true;
+  try{
+    const r=await streamRaster(queueRowStream(queuePrepared),total,{
+      ctl:queueCtl,label:'queue',
+      segmentRows:+($('segRows')&&$('segRows').value||128),
+      chunkBytes:+($('chunkSize')&&$('chunkSize').value||64),
+      gapMs:+($('chunkDelay')&&$('chunkDelay').value||40),
+      density:+($('density')&&$('density').value||10),
+      media:+($('mediaType')&&$('mediaType').value||0x0b),
+      onProgress:(sent,tot)=>{$('queueBar').style.width=(tot?(sent/tot*100):0)+'%';},
+    });
+    queueLastAttempt={sentRows:r.sentRows,outcome:r.cancelled?'cancelled':'completed'};
+    if(r.cancelled){
+      $('queueSummary').textContent='cancelled after '+r.sentRows+'/'+total+' rows — press Start to print again from the beginning';
+      $('queueStartBtn').disabled=false;
+    }else{
+      $('queueSummary').textContent='done ✅ '+total+' rows printed';
+      $('queueBar').style.width='100%';
+    }
+    log('🧾 queue job: '+(r.cancelled?'cancelled':'completed')+' ('+r.sentRows+'/'+total+' rows)');
+  }catch(e){
+    queueLastAttempt={sentRows:engineState.sentRows,outcome:'failed'};
+    $('queueSummary').textContent='failed after '+engineState.sentRows+'/'+total+' rows: '+errText(e)+' — nothing was resent';
+    $('queueStartBtn').disabled=false;
+    log('❌ queue print failed: '+errText(e));
+  }finally{
+    $('queuePauseBtn').disabled=true;
+    $('queueResumeBtn').disabled=true;
+    $('queueCancelBtn').disabled=true;
+  }
+}
+function queuePause(){if(queueCtl){queueCtl.paused=true;$('queuePauseBtn').disabled=true;$('queueResumeBtn').disabled=false;}}
+function queueResume(){if(queueCtl){queueCtl.paused=false;$('queuePauseBtn').disabled=false;$('queueResumeBtn').disabled=true;}}
+function queueCancel(){if(queueCtl)queueCtl.cancelled=true;}
 function init(){
   applySettings();
   $('addBar').insertAdjacentHTML('afterend',
@@ -1854,6 +2459,12 @@ function init(){
   setDesign({name:'Untitled',gap:10,elements:[]});
   renderRecent();
   $('labFile').addEventListener('change',e=>labLoadFile(e.target));
+  $('queueFile').addEventListener('change',e=>{queueAddFiles(e.target.files);e.target.value='';});
+  const qd=$('queueDrop');
+  qd.addEventListener('dragover',e=>{e.preventDefault();qd.style.borderColor='#222';});
+  qd.addEventListener('dragleave',()=>{qd.style.borderColor='#999';});
+  qd.addEventListener('drop',e=>{e.preventDefault();qd.style.borderColor='#999';queueAddFiles(e.dataTransfer.files);});
+  queueRenderList();
   const labSlider=(id,key,vid,suf)=>{$(id).addEventListener('input',e=>{labState[key]=+e.target.value;$(vid).textContent=e.target.value+(suf||'');labRender();});};
   labSlider('labBright','bright','labBrightVal');
   labSlider('labContrast','contrast','labContrastVal');
